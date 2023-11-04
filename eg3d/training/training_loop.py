@@ -27,9 +27,11 @@ from torch_utils.ops import grid_sample_gradfix
 
 import legacy
 from metrics import metric_main
-from camera_utils import LookAtPoseSampler
+from camera_utils import LookAtPoseSampler,UniformCameraPoseSampler
 from training.crosssection_utils import sample_cross_section
 
+from pytorch3d import transforms
+import trimesh
 #----------------------------------------------------------------------------
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
@@ -144,6 +146,25 @@ def training_loop(
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
     training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
+    # a=transforms.matrix_to_quaternion(torch.from_numpy(training_set._get_raw_labels())[...,:16].view(-1, 4, 4)[...,:3,:3])[...,1:] # [N, 3]
+    # # save this pointcloud using trimesh
+    # trimesh.points.PointCloud(vertices=training_set._get_raw_labels()[...,:16].view(-1,4,4)[...,:3,3]).export('viewpoints.ply')
+    # quaternion_mean=training_set._get_raw_labels_quaternion_mean()
+    # quaternion_std=training_set._get_raw_labels_quaternion_std()
+    # quaternion_max=np.abs(training_set._get_raw_labels_quaternion()).max(0)
+    # noise=np.random.uniform(-1, 1, size=(10000, 4))
+    # noise_std=noise.std(0)
+    # # noise=noise/noise_std*quaternion_std
+    # noise=quaternion_max*noise
+    # quaternion=noise+quaternion_mean
+    # quaternion=quaternion/np.linalg.norm(quaternion, axis=-1, keepdims=True)
+    # trimesh.points.PointCloud(vertices=quaternion[...,1:]).export('viewpoints_sampled.ply')
+    # c2ws=UniformCameraPoseSampler.sample(np.pi/2, np.pi/2 , horizontal_stddev=np.pi/4,vertical_stddev=np.pi/4,
+    #             lookat_position=torch.tensor(G_kwargs.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=torch.device('cpu')), 
+    #             radius=G_kwargs.rendering_kwargs.get('avg_camera_radius', 2.7), device=torch.device('cpu'),batch_size=10000)
+    # qtns=transforms.matrix_to_quaternion(c2ws[...,:3,:3])[...,1:]
+    # trimesh.points.PointCloud(vertices=c2ws[...,:3,3].cpu().numpy()).export('viewpoints_sampled_uniformcamsampler.ply')
+
     if rank == 0:
         print()
         print('Num images: ', len(training_set))
@@ -414,11 +435,13 @@ def training_loop(
                 print(run_dir)
                 print('Evaluating metrics...')
             for metric in metrics:
+                if rank==0: print(metric)
                 result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
                     dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
                 if rank == 0:
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
                 stats_metrics.update(result_dict.results)
+            if rank==0:print('Done evaluating metrics')
         del snapshot_data # conserve memory
 
         # Collect statistics.
@@ -430,6 +453,7 @@ def training_loop(
             training_stats.report0('Timing/' + phase.name, value)
         stats_collector.update()
         stats_dict = stats_collector.as_dict()
+        if rank == 0: print('Done collecting stats')
 
         # Update logs.
         timestamp = time.time()
@@ -453,6 +477,7 @@ def training_loop(
         tick_start_nimg = cur_nimg
         tick_start_time = time.time()
         maintenance_time = tick_start_time - tick_end_time
+        if rank==0: print('Next tick')
         if done:
             break
 

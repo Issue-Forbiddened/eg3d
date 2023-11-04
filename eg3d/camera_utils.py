@@ -77,9 +77,9 @@ class LookAtPoseSampler:
 
         camera_origins = torch.zeros((batch_size, 3), device=device)
 
-        camera_origins[:, 0:1] = radius*torch.sin(phi) * torch.cos(math.pi-theta)
-        camera_origins[:, 2:3] = radius*torch.sin(phi) * torch.sin(math.pi-theta)
-        camera_origins[:, 1:2] = radius*torch.cos(phi)
+        camera_origins[:, 0:1] = radius*torch.sin(phi) * torch.cos(math.pi-theta) # theta是与-x的夹角
+        camera_origins[:, 2:3] = radius*torch.sin(phi) * torch.sin(math.pi-theta) 
+        camera_origins[:, 1:2] = radius*torch.cos(phi) # phi是与y的夹角
 
         # forward_vectors = math_utils.normalize_vecs(-camera_origins)
         forward_vectors = math_utils.normalize_vecs(lookat_position - camera_origins)
@@ -97,7 +97,7 @@ class UniformCameraPoseSampler:
     """
 
     @staticmethod
-    def sample(horizontal_mean, vertical_mean, horizontal_stddev=0, vertical_stddev=0, radius=1, batch_size=1, device='cpu'):
+    def sample(horizontal_mean, vertical_mean, lookat_position=None,horizontal_stddev=0, vertical_stddev=0, radius=1, batch_size=1, device='cpu'):
         h = (torch.rand((batch_size, 1), device=device) * 2 - 1) * horizontal_stddev + horizontal_mean
         v = (torch.rand((batch_size, 1), device=device) * 2 - 1) * vertical_stddev + vertical_mean
         v = torch.clamp(v, 1e-5, math.pi - 1e-5)
@@ -112,7 +112,7 @@ class UniformCameraPoseSampler:
         camera_origins[:, 2:3] = radius*torch.sin(phi) * torch.sin(math.pi-theta)
         camera_origins[:, 1:2] = radius*torch.cos(phi)
 
-        forward_vectors = math_utils.normalize_vecs(-camera_origins)
+        forward_vectors = math_utils.normalize_vecs(-camera_origins if lookat_position is None else lookat_position - camera_origins)
         return create_cam2world_matrix(forward_vectors, camera_origins)    
 
 def create_cam2world_matrix(forward_vector, origin):

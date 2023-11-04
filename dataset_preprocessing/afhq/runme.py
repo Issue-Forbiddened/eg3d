@@ -19,14 +19,16 @@ import gdown
 
 parser = argparse.ArgumentParser()
 parser.add_argument('inzip', type=str) # the AFHQ zip downloaded from starganV2 (https://github.com/clovaai/stargan-v2)
-parser.add_argument('outzip', type=str, required=False, default='processed_afhq.zip') # this is the output path to write the new zip
+parser.add_argument('outzip', type=str, default='processed_afhq.zip') # this is the output path to write the new zip
 args = parser.parse_args()
 
 
 eg3d_root = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..')
 
-input_dataset_path = os.path.realpath(args.inzip)
-output_dataset_path = os.path.realpath(args.outzip)
+input_dataset_path = args.inzip
+print(f"Input dataset path: {input_dataset_path}")
+output_dataset_path = args.outzip
+print(f"Output dataset path: {output_dataset_path}")
 
 dataset_tool_path = os.path.join(eg3d_root, 'eg3d', 'dataset_tool.py')
 mirror_tool_path = os.path.join(eg3d_root, 'dataset_preprocessing', 'mirror_dataset.py')

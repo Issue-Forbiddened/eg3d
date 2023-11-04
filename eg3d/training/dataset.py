@@ -17,6 +17,7 @@ import PIL.Image
 import json
 import torch
 import dnnlib
+from pytorch3d import transforms
 
 try:
     import pyspng
@@ -39,6 +40,7 @@ class Dataset(torch.utils.data.Dataset):
         self._use_labels = use_labels
         self._raw_labels = None
         self._label_shape = None
+        self._raw_labels_quaternion=None
 
         # Apply max_size.
         self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
@@ -65,6 +67,25 @@ class Dataset(torch.utils.data.Dataset):
                 assert np.all(self._raw_labels >= 0)
             self._raw_labels_std = self._raw_labels.std(0)
         return self._raw_labels
+    
+    def _get_raw_labels_quaternion(self):
+        if self._raw_labels_quaternion is None:
+            raw_labels=torch.from_numpy(self._get_raw_labels()) # (N,25)
+            raw_labels=raw_labels[...,:16].view(-1,4,4)[...,:3,:3]
+            raw_labels_quaternion=transforms.matrix_to_quaternion(raw_labels)
+            self._raw_labels_quaternion=raw_labels_quaternion.numpy()
+        return self._raw_labels_quaternion
+    
+    def _get_raw_labels_quaternion_mean(self):
+        raw_labels_quaternion=self._get_raw_labels_quaternion()
+        raw_labels_quaternion_mean=np.mean(raw_labels_quaternion,axis=0)
+        raw_labels_quaternion_mean=raw_labels_quaternion_mean/np.linalg.norm(raw_labels_quaternion_mean)
+        return raw_labels_quaternion_mean
+        
+    def _get_raw_labels_quaternion_std(self):   
+        raw_labels_quaternion=self._get_raw_labels_quaternion()
+        raw_labels_quaternion_std=np.std(raw_labels_quaternion,axis=0)
+        return raw_labels_quaternion_std
 
     def close(self): # to be overridden by subclass
         pass

@@ -26,7 +26,7 @@ import mrcfile
 import legacy
 from camera_utils import LookAtPoseSampler, FOV_to_intrinsics
 from torch_utils import misc
-from training.triplane import TriPlaneGenerator
+from training.triplane import TriPlaneGenerator,TriPlaneGenerator_Modified
 
 
 #----------------------------------------------------------------------------
@@ -145,7 +145,7 @@ def generate_images(
     # Specify reload_modules=True if you want code modifications to take effect; otherwise uses pickled code
     if reload_modules:
         print("Reloading Modules!")
-        G_new = TriPlaneGenerator(*G.init_args, **G.init_kwargs).eval().requires_grad_(False).to(device)
+        G_new = TriPlaneGenerator_Modified(*G.init_args, **G.init_kwargs).eval().requires_grad_(False).to(device)
         misc.copy_params_and_buffers(G, G_new, require_all=True)
         G_new.neural_rendering_resolution = G.neural_rendering_resolution
         G_new.rendering_kwargs = G.rendering_kwargs
@@ -168,6 +168,7 @@ def generate_images(
             cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
             cam2world_pose = LookAtPoseSampler.sample(np.pi/2 + angle_y, np.pi/2 + angle_p, cam_pivot, radius=cam_radius, device=device)
             conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device)
+            # conditioning_cam2world_pose=cam2world_pose
             camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
             conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
 

@@ -201,8 +201,7 @@ def main(**kwargs):
 
     \b
     # Train StyleGAN3-T for AFHQv2 using 8 GPUs.
-    python train.py --outdir=~/training-runs --cfg=stylegan3-t --data=~/datasets/afhqv2-512x512.zip \\
-        --gpus=8 --batch=32 --gamma=8.2 --mirror=1
+    python train.py --outdir=./training-runs --cfg=afhq --data=/home1/jo_891/data1/eg3d/datasets/afhqv2-512x512_.zip --gpus=2 --batch=32 --gamma=8.2 --mirror=1
 
     \b
     # Fine-tune StyleGAN3-R for MetFaces-U using 1 GPU, starting from the pre-trained FFHQ-U pickle.
