@@ -264,6 +264,11 @@ class TriPlaneGenerator_Modified(torch.nn.Module):
         planes = planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
         return self.renderer.run_model(planes, self.decoder, coordinates, directions, self.rendering_kwargs)
 
+    def sample_with_planes(self,coordinates,directions,planes,decoder=None):
+        decoder=self.decoder if decoder is None else decoder
+        planes=planes.view(len(planes), 3, 32, planes.shape[-2], planes.shape[-1])
+        return self.renderer.run_model(planes, decoder, coordinates, directions, self.rendering_kwargs)
+
     def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, neural_rendering_resolution=None, update_emas=False, cache_backbone=False, use_cached_backbone=False, **synthesis_kwargs):
         # Render a batch of generated images.
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)

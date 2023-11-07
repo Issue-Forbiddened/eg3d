@@ -50,7 +50,6 @@ import math
 import json
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers import AutoencoderKL
 #----------------------------------------------------------------------------
 
 def parse_range(s: Union[str, List]) -> List[int]:
@@ -140,7 +139,6 @@ class Encoder(ModelMixin,ConfigMixin):
     ):
         super().__init__()
         self.layers_per_block = layers_per_block
-        self.down_sample_conv=nn.Conv2d(in_channels, in_channels, kernel_size=down_sampling_ratio, stride=down_sampling_ratio)
 
         self.conv_in = nn.Conv2d(
             in_channels,
@@ -149,6 +147,8 @@ class Encoder(ModelMixin,ConfigMixin):
             stride=1,
             padding=1,
         )
+
+        self.down_sample_conv=nn.Conv2d(block_out_channels[0], block_out_channels[0], kernel_size=down_sampling_ratio, stride=down_sampling_ratio)
 
         self.mid_block = None
         self.down_blocks = nn.ModuleList([])
@@ -165,7 +165,7 @@ class Encoder(ModelMixin,ConfigMixin):
                 num_layers=self.layers_per_block,
                 in_channels=input_channel,
                 out_channels=output_channel,
-                add_downsample=not is_final_block,
+                add_downsample=True,
                 resnet_eps=1e-6,
                 downsample_padding=0,
                 resnet_act_fn=act_fn,
@@ -175,25 +175,25 @@ class Encoder(ModelMixin,ConfigMixin):
             )
             self.down_blocks.append(down_block)
 
-        # mid
-        self.mid_block = UNetMidBlock2D(
-            in_channels=block_out_channels[-1],
-            resnet_eps=1e-6,
-            resnet_act_fn=act_fn,
-            output_scale_factor=1,
-            resnet_time_scale_shift="default",
-            attention_head_dim=block_out_channels[-1],
-            resnet_groups=norm_num_groups,
-            temb_channels=None,
-        )
+        # # mid
+        # self.mid_block = UNetMidBlock2D(
+        #     in_channels=block_out_channels[i],
+        #     resnet_eps=1e-6,
+        #     resnet_act_fn=act_fn,
+        #     output_scale_factor=1,
+        #     resnet_time_scale_shift="default",
+        #     attention_head_dim=output_channel,
+        #     resnet_groups=norm_num_groups,
+        #     temb_channels=None,
+        # )
 
         self.gradient_checkpointing = False
 
     def forward(self, x):
         sample = x
-        sample=self.down_sample_conv(sample)
-        sample = self.conv_in(sample)
         
+        sample = self.conv_in(sample)
+        sample=self.down_sample_conv(sample)
 
         down_block_res_samples=tuple()
 
@@ -211,29 +211,29 @@ class Encoder(ModelMixin,ConfigMixin):
                     sample = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(down_block), sample, use_reentrant=False
                     )
-                    down_block_res_samples=down_block_res_samples+(sample,)
-                # middle
-                sample = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(self.mid_block), sample, use_reentrant=False
-                )
-                down_block_res_samples=down_block_res_samples+(sample,)
+                    down_block_res_samples=down_block_res_samples+(sample.flatten(-2,-1).permute(0,2,1),)
+                # # middle
+                # sample = torch.utils.checkpoint.checkpoint(
+                #     create_custom_forward(self.mid_block), sample, use_reentrant=False
+                # )
+                # down_block_res_samples=down_block_res_samples+(sample.flatten(-2,-1).permute(0,2,1),)
             else:
                 for down_block in self.down_blocks:
                     sample = torch.utils.checkpoint.checkpoint(create_custom_forward(down_block), sample)
-                    down_block_res_samples=down_block_res_samples+(sample,)
-                # middle
-                sample = torch.utils.checkpoint.checkpoint(create_custom_forward(self.mid_block), sample)
-                down_block_res_samples=down_block_res_samples+(sample,)
+                    down_block_res_samples=down_block_res_samples+(sample.flatten(-2,-1).permute(0,2,1),)
+                # # middle
+                # sample = torch.utils.checkpoint.checkpoint(create_custom_forward(self.mid_block), sample)
+                # down_block_res_samples=down_block_res_samples+(sample.flatten(-2,-1).permute(0,2,1),)
 
         else:
             # down
             for down_block in self.down_blocks:
                 sample = down_block(sample)
-                down_block_res_samples=down_block_res_samples+(sample,)
+                down_block_res_samples=down_block_res_samples+(sample.flatten(-2,-1).permute(0,2,1),)
         
             # middle
-            sample = self.mid_block(sample)
-            down_block_res_samples=down_block_res_samples+(sample,)
+            # sample = self.mid_block(sample)
+            # down_block_res_samples=down_block_res_samples+(sample.flatten(-2,-1).permute(0,2,1),)
 
         return down_block_res_samples
 
@@ -560,7 +560,7 @@ def parse_args():
     parser.add_argument(
         '--num_inference_steps', help='Number of inference steps', type=int, required=False, default=50
     )
-
+    parser.add_argument("--wandb_offline", action="store_true", help="Whether to run wandb offline.")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -618,60 +618,35 @@ def generate_images():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
+        
               
-    unet_config={'in_channels':128,
-        'out_channels':128,
-        'block_out_channels':(128, 256, 512, 512),
-        'cross_attention_dim':(64, 128, 256, 512),
-        'attention_head_dim':8,
+    unet_config={'in_channels':96,
+        'out_channels':96,
+        'down_block_types':('ResnetDownsampleBlock2D','ResnetDownsampleBlock2D','CrossAttnDownBlock2D','CrossAttnDownBlock2D','CrossAttnDownBlock2D','DownBlock2D'),
+        # size (128,64,32,16,8,4)
+        'block_out_channels':(128, 160, 192, 384, 768, 768),
+        'cross_attention_dim':(64, 64, 64, 128, 256, 512),
+        'up_block_types':("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D","ResnetUpsampleBlock2D","ResnetUpsampleBlock2D"),
+        'attention_head_dim':4,
         'down_sampling_ratio':1,
         'use_linear_projection':True
                                           }
-    # unet 的输出维度是 (batch_size,64,16,16) (batch_size,128,8,8) (batch_size,256,4,4) (batch_size,512,2,2)
-
+    
     unet=UNet2DConditionModel_downsample(**unet_config)
-    unet.requires_grad_(True)
 
     if args.use_ema:
         ema_unet = EMAModel(unet.parameters(), model_cls=UNet2DConditionModel_downsample, model_config=unet.config)
 
     encoder_config={'in_channels':3,
-                    'down_block_types':("DownEncoderBlock2D","DownEncoderBlock2D",
-                                        "DownEncoderBlock2D","DownEncoderBlock2D"),
+                    'down_block_types':("DownEncoderBlock2D","DownEncoderBlock2D","DownEncoderBlock2D","DownEncoderBlock2D"),
                     'block_out_channels':(64, 128, 256, 512),
-                    'down_sampling_ratio':1,
+                    'down_sampling_ratio':4,
                                 }
-    # encoder 的输出维度是 (batch_size,64,256,256) (batch_size,128,128,128) (batch_size,256,64,64) (batch_size,512,32,32)
 
     encoder=Encoder(**encoder_config)
-    encoder.requires_grad_(True)
-
 
     if args.use_ema:
         ema_encoder = EMAModel(encoder.parameters(), model_cls=Encoder,model_config=encoder.config)
-        
-
-    vae_config={
-        'in_channels':96,
-        'out_channels':96,
-        'down_block_types':("DownEncoderBlock2D","DownEncoderBlock2D","DownEncoderBlock2D"),
-        'up_block_types':("UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D"),
-        'block_out_channels':(192, 384, 384),
-        'latent_channels':128,
-        'sample_size':256,
-        'scaling_factor':1.,
-    }
-    # vae 的输出维度是 (batch_size,latent_channels,32,32)
-
-    vae=AutoencoderKL(**vae_config)
-    vae.requires_grad_(True)
-
-    unet_input_size=vae_config['sample_size']//8
-
-
-
-    if args.use_ema:
-        ema_vae = EMAModel(vae.parameters(), model_cls=AutoencoderKL,model_config=vae.config)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -681,15 +656,12 @@ def generate_images():
                 if args.use_ema:
                     ema_encoder.save_pretrained(os.path.join(output_dir, "encoder_ema"))
                     ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
-                    ema_vae.save_pretrained(os.path.join(output_dir, "vae_ema"))
 
                 for i, model in enumerate(models):
                     if isinstance(model, Encoder):
                         model.save_pretrained(os.path.join(output_dir, "encoder"))
                     elif isinstance(model, UNet2DConditionModel_downsample):
                         model.save_pretrained(os.path.join(output_dir, "unet"))
-                    elif isinstance(model, AutoencoderKL):
-                        model.save_pretrained(os.path.join(output_dir, "vae"))
                     # make sure to pop weight so that corresponding model is not saved again
                     weights.pop()
 
@@ -701,10 +673,6 @@ def generate_images():
                 load_model = EMAModel.from_pretrained(os.path.join(input_dir, "encoder_ema"), Encoder)
                 ema_encoder.load_state_dict(load_model.state_dict())
                 ema_encoder.to(accelerator.device)
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "vae_ema"), AutoencoderKL)
-                ema_vae.load_state_dict(load_model.state_dict())
-                ema_vae.to(accelerator.device)
-
                 del load_model
 
             for i in range(len(models)):
@@ -716,8 +684,6 @@ def generate_images():
                     load_model = Encoder.from_pretrained(input_dir, subfolder="encoder")
                 elif isinstance(model, UNet2DConditionModel_downsample):
                     load_model = UNet2DConditionModel_downsample.from_pretrained(input_dir, subfolder="unet")
-                elif isinstance(model, AutoencoderKL):
-                    load_model = AutoencoderKL.from_pretrained(input_dir, subfolder="vae")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -728,7 +694,6 @@ def generate_images():
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-        vae.enable_gradient_checkpointing()
 
     if args.scale_lr:
         args.learning_rate = (
@@ -796,26 +761,16 @@ def generate_images():
     # snr=1/((noise_scheduler_dummy.alphas_cumprod)**(-1)-1)
     # logsnr=torch.log(snr)
     # logsnr_shifted=logsnr+2*np.log(64/256)
-    # snr_shifted=torch.exp(logsnr_shifted)--log_step_interval
+    # snr_shifted=torch.exp(logsnr_shifted)
     # alphas_cumprod_shifted=1/(1+(1/snr_shifted))
     # betas=torch.stack([1-alphas_cumprod_shifted[i+1]/alphas_cumprod_shifted[i] for i in range(len(alphas_cumprod_shifted)-1)]+[noise_scheduler_dummy.betas[-1]])
     # betas=betas.cpu().numpy().tolist()
     # noise_scheduler_config_dummpy['trained_betas']=betas
-
-
     noise_scheduler=diffusers.schedulers.DDIMScheduler(**noise_scheduler_config_dummpy)
 
 
                    
-
-    # params should be unet's parameters + encoder's parameters + vae's parameters
-    # vae's lr is 10 times of unet's and encoder's
-    unet_params={'params':unet.parameters(),'lr':args.learning_rate}
-    encoder_params={'params':encoder.parameters(),'lr':args.learning_rate}
-    vae_params={'params':vae.parameters(),'lr':10*args.learning_rate}
-    params=[unet_params,encoder_params,vae_params]
-
-
+    params = list(unet.parameters()) + list(encoder.parameters())
     optimizer_cls = torch.optim.AdamW
     optimizer = optimizer_cls(
         params,
@@ -833,16 +788,15 @@ def generate_images():
     )
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
-        accelerator.init_trackers(args.tracker_project_name, tracker_config)
-    unet, optimizer, lr_scheduler,encoder,vae = accelerator.prepare(
-        unet, optimizer, lr_scheduler,encoder,vae
+        init_kwargs={'wandb':{'mode':'offline'}} if args.wandb_offline else {}
+        accelerator.init_trackers(args.tracker_project_name, tracker_config,init_kwargs)
+    unet, optimizer, lr_scheduler, encoder = accelerator.prepare(
+        unet, optimizer, lr_scheduler, encoder
     )
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
         ema_encoder.to(accelerator.device)
-        ema_vae.to(accelerator.device)
-
 
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -898,13 +852,14 @@ def generate_images():
 
     if not os.path.exists(os.path.join(args.output_dir,'stats_dict.json')):
         if accelerator.is_main_process:
-            total_batch=100000
-            minibatch=64
+            total_sample=100000
+            minibatch=128
+            total_batch=total_sample//minibatch
             sample_count=0
             mean = torch.zeros([96, 256, 256], device=device,dtype=torch.float64)
             M2 = torch.zeros([96, 256, 256], device=device,dtype=torch.float64)
             with torch.no_grad():
-                for idx in tqdm(range(total_batch//minibatch),desc='getting scale:'):
+                for idx in tqdm(range(total_batch),desc='getting scale:'):
                     z_generator=torch.randn(minibatch, G.z_dim, device=device)
                     cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
                     cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
@@ -924,13 +879,13 @@ def generate_images():
                         sample_count += minibatch
                         delta = planes - mean
                         mean += delta.sum(dim=0) / sample_count
-                        M2 += (delta**2).sum(dim=0)
+                        M2 += (1/sample_count)*((sample_count-minibatch)/(sample_count)*((delta**2).sum(dim=0))-M2)
             # 计算最终的方差
-            variance = M2 / (sample_count - 1)
+            variance = M2 
             # 计算标准差
-            std = torch.sqrt(variance).mean(dim=[1, 2]) # (96,)
+            std = torch.sqrt(variance) # (96,256,256)
             std = std.cpu().numpy().tolist()
-            mean_list = mean.mean(dim=[1, 2]).cpu().numpy().tolist()  # (96,)
+            mean_list = mean.cpu().numpy().tolist()  # (96,256,256)
             stats_dict = {'mean': mean_list, 'std': std}
             with open(os.path.join(args.output_dir,'stats_dict.json'),'w') as f:
                 json.dump(stats_dict,f)
@@ -939,86 +894,66 @@ def generate_images():
     # read stats_dict
     with open(os.path.join(args.output_dir,'stats_dict.json'),'r') as f:
         stats_dict=json.load(f)
-    mean=torch.tensor(stats_dict['mean'],device=device,dtype=weight_dtype).reshape(1,96,1,1)
-    std=torch.tensor(stats_dict['std'],device=device,dtype=weight_dtype).reshape(1,96,1,1)
-    normalize_fn=lambda x: (x-mean)/std
-    inv_normalize_fn=lambda x: x*std+mean
+    mean_load=torch.tensor(stats_dict['mean'],device=device,dtype=weight_dtype).reshape(1,96,256,256)
+    std_load=torch.tensor(stats_dict['std'],device=device,dtype=weight_dtype).reshape(1,96,256,256)
+    normalize_fn=lambda x: (x-mean_load)/std_load
+    inv_normalize_fn=lambda x: x*std_load+mean_load
     
-    if mean.isnan().any():
+    if mean_load.isnan().any():
         raise ValueError('mean has nan value')
-    if std.isnan().any():
+    if std_load.isnan().any():
         raise ValueError('std has nan value')
-
+    
     if False:
-        if not os.path.exists(os.path.join(args.output_dir,'scale_factor_tanh.json')):
-            if accelerator.is_main_process:
-                total_batch=100000
-                minibatch=64
-                sample_count=0
-                mean = torch.zeros([96, 256, 256], device=device,dtype=torch.float64)
-                M2 = torch.zeros([96, 256, 256], device=device,dtype=torch.float64)
-                with torch.no_grad():
-                    for idx in tqdm(range(total_batch//minibatch),desc='getting scale:'):
-                        z_generator=torch.randn(minibatch, G.z_dim, device=device)
-                        cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
-                        cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
-                        cam2world_pose=UniformCameraPoseSampler.sample(np.pi/2, np.pi/2 , horizontal_stddev=np.pi/4,vertical_stddev=np.pi/4,
-                            lookat_position=torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device), 
-                            radius=G.rendering_kwargs.get('avg_camera_radius', 2.7), device=device,batch_size=minibatch)
-                        conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device,batch_size=minibatch)
-                        camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
-                        conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
+        if accelerator.is_main_process:
+            total_sample=10000
+            minibatch=128
+            total_batch=total_sample//minibatch
+            sample_count=0
+            mean = torch.zeros([96, 256, 256], device=device,dtype=torch.float64)
+            M2 = torch.zeros([96, 256, 256], device=device,dtype=torch.float64)
+            with torch.no_grad():
+                for idx in tqdm(range(total_batch),desc='getting scale:'):
+                    z_generator=torch.randn(minibatch, G.z_dim, device=device)
+                    cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
+                    cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
+                    cam2world_pose=UniformCameraPoseSampler.sample(np.pi/2, np.pi/2 , horizontal_stddev=np.pi/4,vertical_stddev=np.pi/4,
+                        lookat_position=torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device), 
+                        radius=G.rendering_kwargs.get('avg_camera_radius', 2.7), device=device,batch_size=minibatch)
+                    conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device,batch_size=minibatch)
+                    camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
+                    conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
 
-                        ws = G.mapping(z_generator, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-                        planes=G.get_planes(ws) # (batch_size,96,256,256)
-                        planes= planes*scale_factor
-                        planes= planes.to(torch.float64)
-                        planes=torch.tanh(planes).to(torch.float64)
+                    ws = G.mapping(z_generator, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
+                    planes=G.get_planes(ws) # (batch_size,96,256,256)
+                    planes= planes.to(torch.float64)
+                    planes = normalize_fn(planes)
+                    # planes=torch.tanh(planes).to(torch.float64)
 
-                        if not torch.isnan(planes).any():
-                            sample_count += minibatch
-                            delta = planes - mean
-                            mean += delta.sum(dim=0) / sample_count
-                            M2 += (delta**2).sum(dim=0)
-                # 计算最终的方差
-                variance = M2 / (sample_count - 1)
-                # 计算标准差
-                scale_factor_tanh = torch.sqrt(variance).mean(dim=[1, 2]) # (96,)
-                scale_factor_tanh=1/scale_factor_tanh
-                scale_factor_tanh = scale_factor_tanh.cpu().numpy().tolist()
-                with open(os.path.join(args.output_dir,'scale_factor_tanh.json'),'w') as f:
-                    json.dump(scale_factor_tanh,f)
-                
+                    if not torch.isnan(planes).any():
+                        sample_count += minibatch
+                        delta = planes - mean
+                        mean += delta.sum(dim=0) / sample_count
+                        M2 += (1/sample_count)*((sample_count-minibatch)/(sample_count)*((delta**2).sum(dim=0))-M2)
+
+            print(f'mean:{mean.mean().item()},std:{torch.sqrt(M2).mean().item()}')
+
     accelerator.wait_for_everyone()
-    if False:
-        # read scale_factor
-        with open(os.path.join(args.output_dir,'scale_factor_tanh.json'),'r') as f:
-            scale_factor_tanh=json.load(f)
-        scale_factor_tanh=torch.tensor(scale_factor_tanh,device=device,dtype=weight_dtype).reshape(1,96,1,1)
-        scale_factor_tanh=torch.ones_like(scale_factor_tanh)
-        
-        if scale_factor_tanh.isnan().any():
-            raise ValueError('scale_factor_tanh has nan value')
-
-
 
     sanity_checked=False
-
+    encoder_output_shape=None
     for epoch in tqdm(range(first_epoch, args.num_train_epochs),desc='epoch:',disable=not accelerator.is_main_process):
-        unet_loss=0.0
-        vae_kl_loss=0.0
-        vae_recon_loss=0.0
-        only_vae=epoch<10
-        train_batch_size=args.train_batch_size if not only_vae else 8
+        train_loss=0.0
         for step in tqdm(range(epoch_size),desc='step:',disable=not accelerator.is_main_process):
+            none_condition=False
             with torch.no_grad():
-                z_generator=torch.randn(train_batch_size, G.z_dim, device=device)
+                z_generator=torch.randn(args.train_batch_size, G.z_dim, device=device)
                 cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
                 cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
                 cam2world_pose=UniformCameraPoseSampler.sample(np.pi/2, np.pi/2 , horizontal_stddev=np.pi/4,vertical_stddev=np.pi/4,
                     lookat_position=torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device), 
-                    radius=G.rendering_kwargs.get('avg_camera_radius', 2.7), device=device,batch_size=train_batch_size)
-                conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device,batch_size=train_batch_size)
+                    radius=G.rendering_kwargs.get('avg_camera_radius', 2.7), device=device,batch_size=args.train_batch_size)
+                conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device,batch_size=args.train_batch_size)
                 camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
                 conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
 
@@ -1026,69 +961,51 @@ def generate_images():
                 planes=G.get_planes(ws) # (batch_size,96,256,256)
                 eg3doutput=G.render_from_planes(camera_params,planes)
             
-            # get input of vae
-            planes_normalized=normalize_fn(planes)
-            # encode with vae
-
-            latents=accelerator.unwrap_model(vae).encode(planes_normalized).latent_dist
-            latents_sample=latents.sample()
-            if not only_vae:
-                noise=torch.randn_like(latents_sample)
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (train_batch_size,), device=planes.device)
-                noisy_latents = noise_scheduler.add_noise(latents_sample, noise, timesteps)
-                encoder_states=encoder(eg3doutput['image'].detach())
-
-                encoder_states=[F.interpolate(encoder_state,scale_factor=unet_input_size/encoder_states[0].shape[-2],
-                                            mode='bilinear',align_corners=False).flatten(-2,-1).permute(0,2,1) for encoder_state in encoder_states]
-
-                unet_output=unet(noisy_latents,timesteps,encoder_states)
-
-                if args.snr_gamma is None:
-                    unet_loss = F.mse_loss(unet_output.sample.float(), latents_sample.float(), reduction="mean")
-                else:
-                    snr = compute_snr(noise_scheduler, timesteps)
-                    if noise_scheduler.config.prediction_type == "v_prediction":
-                        # Velocity objective requires that we add one to SNR values before we divide by them.
-                        snr = snr + 1
-                        mse_loss_weights = (
-                            torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
-                        )
-                    elif noise_scheduler.config.prediction_type == "sample":
-                        mse_loss_weights = (
-                            torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0]
-                        )
-                    elif noise_scheduler.config.prediction_type == "noise":
-                        mse_loss_weights = (
-                            torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
-                        )
-                    else:
-                        raise ValueError(f"Invalid prediction_type {noise_scheduler.config.prediction_type}")
-                    unet_loss = F.mse_loss(unet_output.sample.float(), latents_sample.float(), reduction="none")
-                    unet_loss = unet_loss.mean(dim=list(range(1, len(unet_loss.shape)))) * mse_loss_weights
-                    unet_loss = unet_loss.mean()
+            # latents=torch.tanh(planes*scale_factor)*scale_factor_tanh
+            latents=normalize_fn(planes)
+            noise=torch.randn_like(planes)
+            bsz = planes.shape[0]
+            assert bsz==args.train_batch_size
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=planes.device)
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            if np.random.rand()<0.1 and encoder_output_shape is not None and not (global_step%log_step_interval==0 or not sanity_checked):
+                encoder_states=[torch.zeros(encoder_output_shape[i],device=device,dtype=noisy_latents.dtype) for i in range(len(encoder_output_shape))]
+                none_condition=True
             else:
-                unet_loss=torch.tensor(0.0,device=device,dtype=latents_sample.dtype)
+                encoder_states=encoder(eg3doutput['image'].detach())
+                if encoder_output_shape is None:
+                    encoder_output_shape=[state.shape for state in encoder_states]
+            unet_output=unet(noisy_latents,timesteps,encoder_states)
 
-            latents_mode=latents.mode()
-            planes_recon=accelerator.unwrap_model(vae).decode(latents_mode).sample
-            vae_kl_loss=latents.kl().mean()
-            vae_recon_loss=F.mse_loss(planes_recon,planes_normalized,reduction='mean')
-            vae_loss=vae_recon_loss+vae_kl_loss
-
-            loss=unet_loss+vae_loss*10.
-
-            avg_unet_loss = accelerator.gather(unet_loss.repeat(train_batch_size)).mean()
-            unet_loss += avg_unet_loss.item() / args.gradient_accumulation_steps
-            avg_vae_kl_loss = accelerator.gather(vae_kl_loss.repeat(train_batch_size)).mean()
-            vae_kl_loss += avg_vae_kl_loss.item() / args.gradient_accumulation_steps
-            avg_vae_recon_loss = accelerator.gather(vae_recon_loss.repeat(train_batch_size)).mean()
-            vae_recon_loss += avg_vae_recon_loss.item() / args.gradient_accumulation_steps
-
-
+            if args.snr_gamma is None:
+                loss = F.mse_loss(unet_output.sample.float(), latents.float(), reduction="mean")
+            else:
+                snr = compute_snr(noise_scheduler, timesteps)
+                # if noise_scheduler.config.prediction_type == "v_prediction":
+                #     # Velocity objective requires that we add one to SNR values before we divide by them.
+                #     snr = snr + 1
+                #     mse_loss_weights = (
+                #         torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                #     )
+                # elif noise_scheduler.config.prediction_type == "sample":
+                #     mse_loss_weights = (
+                #         torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0]
+                #     )
+                # elif noise_scheduler.config.prediction_type == "noise":
+                #     mse_loss_weights = (
+                #         torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                #     )
+                # else:
+                #     raise ValueError(f"Invalid prediction_type {noise_scheduler.config.prediction_type}")
+                mse_loss_weights=torch.sigmoid(torch.log(snr))
+                loss = F.mse_loss(unet_output.sample.float(), latents.float(), reduction="none")
+                loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                loss = loss.mean()
+            avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+            train_loss += avg_loss.item() / args.gradient_accumulation_steps
             accelerator.backward(loss)
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(list(unet.parameters())+list(encoder.parameters())+list(vae.parameters()), 
-                                            args.max_grad_norm)
+                accelerator.clip_grad_norm_(list(unet.parameters())+list(encoder.parameters()), args.max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
@@ -1097,14 +1014,9 @@ def generate_images():
                 if args.use_ema:
                     ema_unet.step(unet.parameters())
                     ema_encoder.step(encoder.parameters())
-                    ema_vae.step(vae.parameters())
                 global_step += 1
-                accelerator.log({"unet_loss": unet_loss}, step=global_step)
-                accelerator.log({"vae_kl_loss": vae_kl_loss}, step=global_step)
-                accelerator.log({"vae_recon_loss": vae_recon_loss}, step=global_step)
-                unet_loss = 0.0
-                vae_kl_loss = 0.0
-                vae_recon_loss = 0.0
+                accelerator.log({"train_loss": train_loss}, step=global_step)
+                train_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -1133,87 +1045,82 @@ def generate_images():
                         logger.info(f"Saved state to {save_path}")
 
 
-            if global_step%log_step_interval==0:
+            if global_step%log_step_interval==0 or not sanity_checked:
                 if accelerator.is_main_process:
                     with torch.no_grad():
-                        image_names=[]
-                        original_render=eg3doutput['image']
-                        recon_latent_render=G.render_from_planes(camera_params,
-                                            inv_normalize_fn(planes_recon))['image']
-                        original_render=(original_render.permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8)
-                        recon_latent_render=(recon_latent_render.permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8)
-                        image_names.append('original')
-                        image_names.append('recon')
-                        if not only_vae:
-                            noisy_latents_render=G.render_from_planes(camera_params,inv_normalize_fn(accelerator.unwrap_model(vae).decode(noisy_latents).sample))['image']
-                            denoised_latent_render=G.render_from_planes(camera_params,
-                                                                    inv_normalize_fn(accelerator.unwrap_model(vae).decode(unet_output.sample).sample))['image']
-                            noisy_latents_render=(noisy_latents_render.permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8)
-                            denoised_latent_render=(denoised_latent_render.permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8)
-                            img_concat=torch.cat([original_render,recon_latent_render,noisy_latents_render,denoised_latent_render],dim=2) # (batch_size,256,768,3)
+                        latent2img_fn=lambda x: (G.render_from_planes(camera_params,inv_normalize_fn(x))['image'].permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8).cpu()
+                        eg3doutput_=eg3doutput['image']
+                        eg3doutput_=(eg3doutput_.permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8).cpu()
+                        eg3doutput_noisy=latent2img_fn(noisy_latents)
+                        eg3doutput_denoised=latent2img_fn(unet_output.sample)
+                        img_concat=torch.cat([eg3doutput_, eg3doutput_noisy,eg3doutput_denoised],dim=2) # (batch_size,256,768,3)
+                        if args.use_ema:
+                            ema_unet.store(unet.parameters())
+                            ema_unet.copy_to(unet.parameters())
+                            ema_encoder.store(encoder.parameters())
+                            ema_encoder.copy_to(encoder.parameters())
+                            encoder_states=encoder(eg3doutput['image'].detach())
+                            unet_output=unet(noisy_latents,timesteps,encoder_states)     
+                            eg3doutput_denoised_ema=latent2img_fn(unet_output.sample)
+                            img_concat=torch.cat([img_concat, eg3doutput_denoised_ema],dim=2)  
+                            
+                            if not encoder_output_shape is None:
+                                encoder_states_none=[torch.zeros(encoder_output_shape[i],device=device,dtype=noisy_latents.dtype) for i in range(len(encoder_output_shape))]
+                                eg3doutput_denoised_none_condition=unet(noisy_latents,timesteps,encoder_states_none)     
+                                eg3doutput_denoised_none_condition=latent2img_fn(eg3doutput_denoised_none_condition.sample)
+                                img_concat=torch.cat([img_concat, eg3doutput_denoised_none_condition],dim=2)
 
-                            image_names.append('noisy_latents')
-                            image_names.append('denoised_latent')
-                            if args.use_ema:
-                                ema_unet.store(unet.parameters())
-                                ema_unet.copy_to(unet.parameters())
-                                ema_encoder.store(encoder.parameters())
-                                ema_encoder.copy_to(encoder.parameters())
-                                ema_vae.store(vae.parameters())
-                                ema_vae.copy_to(vae.parameters())
-                                encoder_states=encoder(eg3doutput['image'].detach())
-                                encoder_states=[F.interpolate(encoder_state,scale_factor=unet_input_size/encoder_states[0].shape[-2],
-                                                mode='bilinear',align_corners=False).flatten(-2,-1).permute(0,2,1) for encoder_state in encoder_states]
-                                unet_output=unet(noisy_latents,timesteps,encoder_states)     
-                                eg3doutput_denoised_ema=G.render_from_planes(camera_params,
-                                                            inv_normalize_fn(accelerator.unwrap_model(vae).decode(unet_output.sample).sample))['image'] 
-                                
-                                eg3doutput_denoised_ema=(eg3doutput_denoised_ema.permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8)
-                                img_concat=torch.cat([img_concat, eg3doutput_denoised_ema],dim=2)  
-                                image_names.append('denoised_latent_ema')
-                                
-                                noise_scheduler.set_timesteps(args.num_inference_steps, device=device)
-                                timesteps = noise_scheduler.timesteps
-                                original_latents=latents_mode.detach().clone()
-                                latents=noise.detach().clone()
-                                reverse_process_list=[]
-                                forward_process_list=[]
-                                reverse_process_list.append(((G.render_from_planes(camera_params,
-                                        inv_normalize_fn(accelerator.unwrap_model(vae).decode(latents).sample))['image']).permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8).cpu())
-                                
+                            noise_scheduler.set_timesteps(args.num_inference_steps, device=device)
+                            timesteps = noise_scheduler.timesteps
+                            original_latents=latents.detach().clone()
+                            latents=noise.detach().clone()
+                            reverse_process_list=[]
+                            forward_process_list=[]
+                            reverse_process_list.append(latent2img_fn(latents))
+
+                            for i, t in enumerate(timesteps):
+                                if i%3==0 or i==len(timesteps)-1:
+                                    forward_process_list.append(latent2img_fn(noise_scheduler.add_noise(original_latents, noise, t)))
+                                pred=unet(latents,t,encoder_states,return_dict=False)[0] 
+                                latents=noise_scheduler.step(pred, t, latents, return_dict=False)[0]
+                                if i%3==0 or i==len(timesteps)-1:
+                                    reverse_process_list.append(latent2img_fn(latents))
+                            reverse_process_list=torch.cat(reverse_process_list,dim=2).flatten(0,1)
+                            forward_process_list=torch.cat(forward_process_list,dim=2).flatten(0,1)
+                            accelerator.log({'reverse_process':wandb.Image(reverse_process_list.numpy())},step=global_step)
+                            accelerator.log({'forward_process':wandb.Image(forward_process_list.numpy())},step=global_step)
+
+                            eg3doutput_denoised_ema_multistep=latent2img_fn(latents)
+                            img_concat=torch.cat([img_concat, eg3doutput_denoised_ema_multistep],dim=2)
+
+                            img_concat=img_concat.flatten(0,1) 
+
+
+                            # 从Original_latents开始加噪声，在不同的加噪声结果上去噪声
+                            choosen_timesteps=[(original_idx,timestep) for original_idx,timestep in enumerate(timesteps) if original_idx%5==0 or original_idx==len(timesteps)-1]
+                            image_list=[]
+                            for idx, (original_idx,timestep) in enumerate(choosen_timesteps):
+                                noisy_latents=noise_scheduler.add_noise(original_latents, noise, timestep)
+                                # image_list.append(((G.render_from_planes(camera_params,inv_normalize_fn(noisy_latents))['image']).permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8).cpu())
+                                image_list.append(latent2img_fn(noisy_latents))
                                 for i, t in enumerate(timesteps):
-                                    if i%3==0 or i==len(timesteps)-1:
-                                        forward_process_list.append(((G.render_from_planes(camera_params,inv_normalize_fn(accelerator.unwrap_model(vae).decode(noise_scheduler.add_noise(original_latents, noise, t)).sample))['image']).permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8).cpu())
-                                    pred=unet(latents,t,encoder_states,return_dict=False)[0] 
-                                    latents=noise_scheduler.step(pred, t, latents, return_dict=False)[0]
-                                    if i%3==0 or i==len(timesteps)-1:
-                                        reverse_process_list.append(((G.render_from_planes(camera_params,
-                                                                            inv_normalize_fn(accelerator.unwrap_model(vae).decode(latents).sample))['image']).permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8).cpu())
-                                reverse_process_list=torch.cat(reverse_process_list,dim=2).flatten(0,1)
-                                forward_process_list=torch.cat(forward_process_list,dim=2).flatten(0,1)
-                                accelerator.log({'reverse_process':wandb.Image(reverse_process_list.numpy())},step=global_step)
-                                accelerator.log({'forward_process':wandb.Image(forward_process_list.numpy())},step=global_step)
+                                    if i<original_idx:
+                                        continue
+                                    pred=unet(noisy_latents,t,encoder_states,return_dict=False)[0]
+                                    noisy_latents=noise_scheduler.step(pred, t, noisy_latents, return_dict=False)[0]
+                                image_list.append(latent2img_fn(noisy_latents))
+                            image_list=torch.cat(image_list,dim=2).flatten(0,1)
+                            accelerator.log({'image_list':wandb.Image(image_list.numpy())},step=global_step)
 
-                                eg3doutput_denoised_ema_multistep=((G.render_from_planes(camera_params,
-                                                                        inv_normalize_fn(accelerator.unwrap_model(vae).decode(latents).sample))['image']).permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8)
-                                img_concat=torch.cat([img_concat, eg3doutput_denoised_ema_multistep],dim=2)
-                                image_names.append('denoised_latent_ema_multistep')
 
-                                img_concat=img_concat[:16].flatten(0,1)
 
-                                ema_unet.restore(unet.parameters())
-                                ema_encoder.restore(encoder.parameters()) 
-                                ema_vae.restore(vae.parameters())
-                        else:
-                            img_concat=torch.cat([original_render,recon_latent_render],dim=2) # (batch_size,256,768,3)
-                            img_concat=img_concat[:16].flatten(0,1)
-
-                        # convert image_names to str with sep '--'
-                        image_names='--'.join(image_names)
+                            ema_unet.restore(unet.parameters())
+                            ema_encoder.restore(encoder.parameters()) 
+                        sanity_checked=True
                         # save to wandb
-                        accelerator.log({'Images':wandb.Image(img_concat.cpu().numpy())},step=global_step)
-                        # accelerator.log({'Image_names':image_names},step=global_step)
-                        logger.info(f"Image_names: {image_names}")
+                        accelerator.log({'origin_noised_denoised_denoisedema_(denoised_none_condition)_denoisedemamultistep':wandb.Image(img_concat.cpu().numpy())},step=global_step)
+
+                        
         accelerator.wait_for_everyone()
 
 
