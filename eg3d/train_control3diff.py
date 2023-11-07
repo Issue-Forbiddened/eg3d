@@ -1097,7 +1097,7 @@ def generate_images():
 
 
                             # 从Original_latents开始加噪声，在不同的加噪声结果上去噪声
-                            choosen_timesteps=[(original_idx,timestep) for original_idx,timestep in enumerate(timesteps) if original_idx%5==0 or original_idx==len(timesteps)-1]
+                            choosen_timesteps=[(original_idx,timestep) for original_idx,timestep in enumerate(timesteps) if original_idx%10==0 or original_idx==len(timesteps)-1]
                             image_list=[]
                             for idx, (original_idx,timestep) in enumerate(choosen_timesteps):
                                 noisy_latents=noise_scheduler.add_noise(original_latents, noise, timestep)
@@ -1113,14 +1113,14 @@ def generate_images():
                             accelerator.log({'image_list':wandb.Image(image_list.numpy())},step=global_step)
 
 
-
                             ema_unet.restore(unet.parameters())
                             ema_encoder.restore(encoder.parameters()) 
-                        sanity_checked=True
                         # save to wandb
                         accelerator.log({'origin_noised_denoised_denoisedema_(denoised_none_condition)_denoisedemamultistep':wandb.Image(img_concat.cpu().numpy())},step=global_step)
+                        del img_concat, eg3doutput_,eg3doutput_noisy,eg3doutput_denoised,encoder_states,unet_output,image_list
+                sanity_checked=True
+                accelerator.wait_for_everyone()
 
-                        
         accelerator.wait_for_everyone()
 
 
@@ -1131,3 +1131,4 @@ if __name__ == "__main__":
     generate_images() # pylint: disable=no-value-for-parameter
 
 #----------------------------------------------------------------------------
+# accelerate launch --mixed_precision=fp16 train_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000
