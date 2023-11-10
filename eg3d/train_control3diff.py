@@ -1412,7 +1412,7 @@ def generate_images():
                         del img_concat, eg3doutput_,eg3doutput_noisy,eg3doutput_denoised,encoder_states,unet_output
                 sanity_checked=True
                 accelerator.wait_for_everyone()
-                return
+                # return
 
         accelerator.wait_for_everyone()
 
