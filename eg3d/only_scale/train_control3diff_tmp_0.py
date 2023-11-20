@@ -53,8 +53,6 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 import lpips
 from torchvision import transforms
 from transformers import  CLIPVisionModelWithProjection
-
-import cv2
 # import matplotlib.pyplot as plt
 #----------------------------------------------------------------------------
 
@@ -578,8 +576,6 @@ def parse_args():
     )
     parser.add_argument("--wandb_offline", action="store_true", help="Whether to run wandb offline.")
 
-    parser.add_argument("--test_video", action="store_true", help="Whether to test video.")
-
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -603,7 +599,6 @@ def latent_guidance(latents,camera_params,G,lpips_fn,gt_dict,inv_norm_fn):
     for k,v in return_dict.items():
         if k =='image':
             loss=loss+lpips_fn(v,gt_dict[k].detach()).mean()
-            loss=loss+F.mse_loss(v,gt_dict[k].detach()).mean()
     gradient=torch.autograd.grad(loss,latents)[0]
     for param in G.parameters():
         if param.grad is not None:
@@ -624,13 +619,13 @@ def forward_process(latent2img_fn,timesteps,noise_scheduler,latents,noise):
 
 def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder_states,
                     camera_params,G,latent_guidance=None,lpips_fn=None,eg3doutput=None,
-                    inv_normalize_fn=None,reverse_type='normal',return_pred=False,return_latents=False):
+                    inv_normalize_fn=None,reverse_type='normal',return_pred=False,):
     reverse_process_list=[]
     latents=latents.detach().clone()
     reverse_process_list.append(latent2img_fn(latents))
 
-    # if reverse_type=='cfg':
-    encoder_states_none=[torch.zeros_like(encoder_state) for encoder_state in encoder_states]
+    if reverse_type=='cfg':
+        encoder_states_none=[torch.zeros_like(encoder_state) for encoder_state in encoder_states]
 
     for i, t in enumerate(timesteps):
         # normal
@@ -638,60 +633,10 @@ def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder
             pred=unet(latents,t,encoder_states,return_dict=False)[0] 
             latents=noise_scheduler.step(pred, t, latents, return_dict=False)[0]
 
-        elif reverse_type=='langevin_correct':
-            step_size=0.25
-            if i<50:
-                sigmas=compute_sigma(noise_scheduler, t)
-                for langevin_step_idx in range(10):
-                    pred=unet(latents,t,encoder_states,return_dict=False)[0] 
-                    pred_non_con=unet(latents,t,encoder_states_none,return_dict=False)[0]
-                    guidance_grad=latent_guidance(pred,camera_params,G,lpips_fn,eg3doutput,inv_normalize_fn)
-                    pred=pred+3.0*(pred-pred_non_con)
-                    pred=pred-1e4*guidance_grad*sigmas.expand_as(guidance_grad)
-                    pred_dict=noise_scheduler.step(pred, t, latents, return_dict=True)
-                    pred_epsilon=pred_dict.pred_epsilon
-                    latents=latents+(-0.5*step_size*pred_epsilon+torch.randn_like(pred_epsilon)*(step_size**0.5))*sigmas.expand_as(pred_epsilon)
-            else:
-                pred=unet(latents,t,encoder_states,return_dict=False)[0] 
-                
-            latents=noise_scheduler.step(pred, t, latents, return_dict=False)[0]
-
-        elif reverse_type=='langevin_correct1':
-            step_size=0.25
-            if i<50:
-                sigmas=compute_sigma(noise_scheduler, t)
-                for langevin_step_idx in range(10):
-                    pred=unet(latents,t,encoder_states,return_dict=False)[0] 
-                    pred_non_con=unet(latents,t,encoder_states_none,return_dict=False)[0]
-                    pred=pred+3.0*(pred-pred_non_con)
-                    pred_dict=noise_scheduler.step(pred, t, latents, return_dict=True)
-                    pred_epsilon=pred_dict.pred_epsilon
-                    latents=latents+(-0.5*step_size*pred_epsilon+torch.randn_like(pred_epsilon)*(step_size**0.5))*sigmas.expand_as(pred_epsilon)
-            else:
-                pred=unet(latents,t,encoder_states,return_dict=False)[0] 
-                
-            latents=noise_scheduler.step(pred, t, latents, return_dict=False)[0]
-
-        elif reverse_type=='langevin_correct2':
-            step_size=0.25
-            if i<40:
-                sigmas=compute_sigma(noise_scheduler, t)
-                for langevin_step_idx in range(10):
-                    pred=unet(latents,t,encoder_states,return_dict=False)[0] 
-                    guidance_grad=latent_guidance(pred,camera_params,G,lpips_fn,eg3doutput,inv_normalize_fn)
-                    pred=pred-1e4*guidance_grad*sigmas.expand_as(guidance_grad)
-                    pred_dict=noise_scheduler.step(pred, t, latents, return_dict=True)
-                    pred_epsilon=pred_dict.pred_epsilon
-                    latents=latents+(-0.5*step_size*pred_epsilon+torch.randn_like(pred_epsilon)*(step_size**0.5))*sigmas.expand_as(pred_epsilon)
-            else:
-                pred=unet(latents,t,encoder_states,return_dict=False)[0] 
-                
-            latents=noise_scheduler.step(pred, t, latents, return_dict=False)[0]
-
         elif reverse_type=='cfg':
             pred_cfg=unet(latents,t,encoder_states,return_dict=False)[0]
             pred_non_con=unet(latents,t,encoder_states_none,return_dict=False)[0]
-            pred_cfg=pred_cfg+2.0*(pred_cfg-pred_non_con)
+            pred_cfg=pred_cfg+4.0*(pred_cfg-pred_non_con)
             latents=noise_scheduler.step(pred_cfg, t, latents, return_dict=False)[0]
             pred=pred_cfg
 
@@ -704,7 +649,7 @@ def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder
             pred_guidance=unet(latents,t,encoder_states,return_dict=False)[0]
             guidance_grad=latent_guidance(pred_guidance,camera_params,G,lpips_fn,eg3doutput,inv_normalize_fn)
             sigmas=compute_sigma(noise_scheduler, t)
-            pred_guidance=pred_guidance-1e4*guidance_grad*sigmas.expand_as(guidance_grad)
+            pred_guidance=pred_guidance-7e5*guidance_grad*sigmas.expand_as(guidance_grad)
             latents=noise_scheduler.step(pred_guidance, t, latents, return_dict=False)[0]
             pred=pred_guidance
         # vgg guidance
@@ -716,7 +661,7 @@ def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder
             pred_guidance=unet(latents,t,encoder_states,return_dict=False)[0]
             guidance_grad=latent_guidance(pred_guidance,camera_params,G,lpips_fn,eg3doutput,inv_normalize_fn)
             snr=compute_snr(noise_scheduler, t)
-            pred_guidance=pred_guidance-5e2*guidance_grad*torch.sigmoid(-torch.log(snr)).expand_as(guidance_grad)
+            pred_guidance=pred_guidance-7e5*guidance_grad*torch.sigmoid(-torch.log(snr)).expand_as(guidance_grad)
             latents=noise_scheduler.step(pred_guidance, t, latents, return_dict=False)[0]
             pred=pred_guidance
 
@@ -842,10 +787,7 @@ def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder
             if return_pred:
                 reverse_process_list.append(latent2img_fn(pred))
             reverse_process_list.append(latent2img_fn(latents))
-    if not return_latents:
-        return reverse_process_list
-    else:
-        return reverse_process_list,latents
+    return reverse_process_list
 
 def generate_images():
     """Generate images using pretrained network_pkl pickle.
@@ -1035,7 +977,7 @@ def generate_images():
     noise_scheduler_dummy=diffusers.schedulers.DDIMScheduler(**noise_scheduler_config_dummpy)
     snr=1/((noise_scheduler_dummy.alphas_cumprod)**(-1)-1)
     logsnr=torch.log(snr)
-    logsnr_shifted=logsnr+2*np.log(64/256)
+    logsnr_shifted=logsnr+2*np.log(1/256)
     snr_shifted=torch.exp(logsnr_shifted)
     alphas_cumprod_shifted=1/(1+(1/snr_shifted))
     betas=torch.stack([1-alphas_cumprod_shifted[i+1]/alphas_cumprod_shifted[i] for i in range(len(alphas_cumprod_shifted)-1)]+[noise_scheduler_dummy.betas[-1]])
@@ -1189,15 +1131,15 @@ def generate_images():
         stats_dict=json.load(f)
     mean_load=torch.tensor(stats_dict['mean'],device=device,dtype=weight_dtype).reshape(1,96,256,256)
     std_load=torch.tensor(stats_dict['std'],device=device,dtype=weight_dtype).reshape(1,96,256,256)
-    normalize_fn=lambda x: (x-mean_load)/(std_load*7.5)
-    inv_normalize_fn=lambda x: x*std_load*7.5+mean_load
+    normalize_fn=lambda x: (x-mean_load)/(std_load)
+    inv_normalize_fn=lambda x: x*std_load+mean_load
     
     if mean_load.isnan().any():
         raise ValueError('mean has nan value')
     if std_load.isnan().any():
         raise ValueError('std has nan value')
     
-    if False:
+    if True:
         if accelerator.is_main_process:
             total_sample=1000000
             minibatch=128
@@ -1281,7 +1223,7 @@ def generate_images():
 
     pitch_range = 0.25
     yaw_range = 0.35
-    frames=50
+    frames=9
     camera_params_val_list=[]
     for frame_idx in range(frames):
         cam2world_pose_val = LookAtPoseSampler.sample(3.14/2 + yaw_range * np.sin(2 * 3.14 * frame_idx / (frames)),
@@ -1290,9 +1232,6 @@ def generate_images():
                                             radius=G.rendering_kwargs['avg_camera_radius'], device=device,batch_size=args.train_batch_size)
         camera_params_val = torch.cat([cam2world_pose_val.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose_val.shape[0],1)], 1)
         camera_params_val_list.append(camera_params_val)
-
-
-
     for epoch in tqdm(range(first_epoch, args.num_train_epochs),desc='epoch:',disable=not accelerator.is_main_process):
         train_loss=0.0
         for step in tqdm(range(epoch_size),desc='step:',disable=not accelerator.is_main_process):
@@ -1335,7 +1274,7 @@ def generate_images():
                 mse_loss_weights=torch.sigmoid(torch.log(snr))
                 loss = F.mse_loss(unet_output.sample.float(), latents.float(), reduction="none")
                 loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                loss = loss.mean() * 7.5
+                loss = loss.mean() 
 
             # with torch.no_grad():
             #     rendered_image=G.render_from_planes(camera_params,inv_normalize_fn(unet_output.sample))['image']
@@ -1427,44 +1366,26 @@ def generate_images():
                             original_latents=latents.detach().clone()
                             latents=noise.detach().clone()
 
-
-
                             forward_process_list=forward_process(latent2img_fn,timesteps,noise_scheduler,original_latents,noise)
                             forward_process_list=torch.cat(forward_process_list,dim=2).flatten(0,1)
                             accelerator.log({'forward_process':wandb.Image(forward_process_list.numpy())},step=global_step)
 
-                            reverse_process_list,denoised_ddim=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
-                                                                 G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='normal',return_pred=True,return_latents=True)
+                            reverse_process_list=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
+                                                                 G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='normal',return_pred=True)
                             eg3doutput_denoised_ema_multistep=reverse_process_list[-1]
                             img_concat=torch.cat([img_concat, eg3doutput_denoised_ema_multistep],dim=2)
                             reverse_process_list=torch.cat(reverse_process_list,dim=2).flatten(0,1)
                             accelerator.log({'reverse_process':wandb.Image(reverse_process_list.numpy())},step=global_step)
                             del reverse_process_list
 
-                            reverse_guidance_process_list,denoised_ddim_cfg=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
-                                                                          G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='cfg',return_pred=True,return_latents=True)
+                            reverse_guidance_process_list=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
+                                                                          G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='cfg',return_pred=True)
                             reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
                             accelerator.log({'reverse_guidance_process_cfg':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
 
-                            reverse_guidance_process_list,denoised_ddim_guided_ori=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
-                                                                          G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='vgg_guidance_0',return_pred=True,return_latents=True)
-                            reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
-                            accelerator.log({'reverse_guidance_process_original':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
-
-                            reverse_guidance_process_list,reverse_guidance_process_g_cfg_langevin=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
-                                                                          G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='langevin_correct',return_pred=True,return_latents=True)
-                            reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
-                            accelerator.log({'reverse_guidance_process_g_cfg_langevin':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
-
-                            reverse_guidance_process_list,reverse_guidance_process_cfg_langevin=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
-                                                                          G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='langevin_correct1',return_pred=True,return_latents=True)
-                            reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
-                            accelerator.log({'reverse_guidance_process_cfg_langevin':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
-
-                            reverse_guidance_process_list,reverse_guidance_process_g_langevin=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
-                                                                          G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='langevin_correct2',return_pred=True,return_latents=True)
-                            reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
-                            accelerator.log({'reverse_guidance_process_g_langevin.':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+                            # reverse_guidance_process_list=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='vgg_guidance_0')
+                            # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
+                            # accelerator.log({'reverse_guidance_process_original':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
 
                             # reverse_guidance_process_list=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='vgg_guidance_1')
                             # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
@@ -1495,17 +1416,17 @@ def generate_images():
                             # accelerator.log({'reverse_guidance_process_controled_rescale_0.8':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)  
 
                             
-                            # encoder_states_first=[torch.cat([state[0:1]]*encoder_states[0].shape[0]) for state in encoder_states]
-                            # reverse_guidance_process_list=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states_first,camera_params,
-                            #                                               G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='normal')
-                            # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
-                            # accelerator.log({'reverse_guidance_process_change_noise':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+                            encoder_states_first=[torch.cat([state[0:1]]*encoder_states[0].shape[0]) for state in encoder_states]
+                            reverse_guidance_process_list=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states_first,camera_params,
+                                                                          G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='normal')
+                            reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
+                            accelerator.log({'reverse_guidance_process_change_noise':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
 
-                            # noise_first=torch.cat([noise[0:1]]*noise.shape[0])
-                            # reverse_guidance_process_list=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise_first,unet_val,encoder_states,camera_params,
-                            #                                               G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='normal')
-                            # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
-                            # accelerator.log({'reverse_guidance_process_change_encoder':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+                            noise_first=torch.cat([noise[0:1]]*noise.shape[0])
+                            reverse_guidance_process_list=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise_first,unet_val,encoder_states,camera_params,
+                                                                          G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='normal')
+                            reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
+                            accelerator.log({'reverse_guidance_process_change_encoder':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
 
                             # reverse_guidance_process_list=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='vgg_guidance_2')
                             # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
@@ -1514,7 +1435,7 @@ def generate_images():
                             # reverse_guidance_process_list=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='vgg_guidance_3')
                             # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
                             # accelerator.log({'reverse_guidance_process_const_large':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)        
-                            # del reverse_guidance_process_list
+                            del reverse_guidance_process_list
 
                             img_concat=img_concat.flatten(0,1) 
 
@@ -1544,19 +1465,19 @@ def generate_images():
                             # accelerator.log({'multiview_image_list':wandb.Image(multiview_image_list.numpy())},step=global_step)
                             # del multiview_image_list
 
- 
-                            # # 首先，不同的encoder_states之间的相似度定义为里面每一个元素的相似度的算术平均
-                            # # 对于每一个元素，计算它和其他元素的相似度，然后取平均
-                            # cosine_similarity_val=torch.zeros((len(encoder_states),encoder_states[0].shape[0],encoder_states[0].shape[0]),device=device)
-                            # for i in range(len(encoder_states)):
-                            #     for j in range(0,len(encoder_states[i])):
-                            #         for k in range(j,len(encoder_states[i])):
-                            #             cosine_similarity_val[i,j,k]=F.cosine_similarity(encoder_states[i][j],encoder_states[i][k],dim=-1).mean()
-                            #         cosine_similarity_val[i,j,j]=1
-                            # cosine_similarity_val=cosine_similarity_val.mean(dim=0)
-                            # # save to txt as a matrix
-                            # cosine_similarity_val=cosine_similarity_val.cpu().numpy()
-                            # np.savetxt(os.path.join(args.output_dir,f'cosine_similarity_val_{global_step}.txt'),cosine_similarity_val)
+
+                            # 首先，不同的encoder_states之间的相似度定义为里面每一个元素的相似度的算术平均
+                            # 对于每一个元素，计算它和其他元素的相似度，然后取平均
+                            cosine_similarity_val=torch.zeros((len(encoder_states),encoder_states[0].shape[0],encoder_states[0].shape[0]),device=device)
+                            for i in range(len(encoder_states)):
+                                for j in range(0,len(encoder_states[i])):
+                                    for k in range(j,len(encoder_states[i])):
+                                        cosine_similarity_val[i,j,k]=F.cosine_similarity(encoder_states[i][j],encoder_states[i][k],dim=-1).mean()
+                                    cosine_similarity_val[i,j,j]=1
+                            cosine_similarity_val=cosine_similarity_val.mean(dim=0)
+                            # save to txt as a matrix
+                            cosine_similarity_val=cosine_similarity_val.cpu().numpy()
+                            np.savetxt(os.path.join(args.output_dir,f'cosine_similarity_val_{global_step}.txt'),cosine_similarity_val)
 
                             # 可视化注意力图
                             encoder_states_img=[encoder_state.reshape(-1,int(np.sqrt(encoder_state.shape[1])),int(np.sqrt(encoder_state.shape[1])),encoder_state.shape[-1]).permute(0,3,1,2) for encoder_state in encoder_states]
@@ -1569,40 +1490,7 @@ def generate_images():
                             encoder_states_img=torch.cat(encoder_states_img,dim=-1).permute(0,2,3,1).flatten(0,1).detach().cpu()
                             accelerator.log({'encoder_states_img':wandb.Image(encoder_states_img.numpy())},step=global_step)
 
-                            if args.test_video:
-                                multiview_image_list=[]
-                                for camera_param_val in camera_params_val_list:
-                                    original_img=latent2img_fn(original_latents,camera_param_val)
-                                    denoised_img=latent2img_fn(denoised_ddim,camera_param_val)
-                                    denoised_cfg_img=latent2img_fn(denoised_ddim_cfg,camera_param_val)
-                                    denoised_guided_ori_img=latent2img_fn(denoised_ddim_guided_ori,camera_param_val)
-                                    denoised_guided_g_cfg_langevin_img=latent2img_fn(reverse_guidance_process_g_cfg_langevin,camera_param_val)
-                                    denoised_guided_cfg_langevin_img=latent2img_fn(reverse_guidance_process_cfg_langevin,camera_param_val)
-                                    denoised_guided_g_langevin_img=latent2img_fn(reverse_guidance_process_g_langevin,camera_param_val)
-                                    concat_img=torch.cat([original_img,denoised_img,denoised_cfg_img,denoised_guided_ori_img,denoised_guided_g_cfg_langevin_img,
-                                                          denoised_guided_cfg_langevin_img,denoised_guided_g_langevin_img
-                                                          ],dim=2).flatten(0,1).numpy() # in range 0-255, shape (batch_size*256,256*2,3)
-                                    multiview_image_list.append(concat_img)
-                                # make video
-                                multiview_image_list=np.stack(multiview_image_list,axis=0) # (frames,batch_size*256,256*2,3)
-                                frame_height, frame_width = multiview_image_list.shape[1], multiview_image_list.shape[2]
-                                video_fps = 25.0
 
-                                # Define the codec and create VideoWriter object
-                                fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                                
-                                out = cv2.VideoWriter(os.path.join(args.output_dir,'output_video_{}.avi'.format(str(global_step))), fourcc, video_fps, (frame_width, frame_height))
-
-                                # Iterate over each frame and write it to the video
-                                for i in range(multiview_image_list.shape[0]):
-                                    frame = multiview_image_list[i]
-
-                                    # OpenCV expects uint8 data in BGR format
-                                    frame_bgr = cv2.cvtColor(frame.astype(np.uint8), cv2.COLOR_RGB2BGR)
-                                    out.write(frame_bgr)
-
-                                # Release the VideoWriter object
-                                out.release()
 
 
                             ema_unet.restore(unet.parameters())
@@ -1610,10 +1498,9 @@ def generate_images():
                         # save to wandb
                         accelerator.log({'origin_noised_denoised_denoisedema_(denoised_none_condition)_denoisedemamultistep':wandb.Image(img_concat.cpu().numpy())},step=global_step)
                         del img_concat, eg3doutput_,eg3doutput_noisy,eg3doutput_denoised,encoder_states,unet_output
-                        return
                 sanity_checked=True
                 accelerator.wait_for_everyone()
-
+                return
 
 
         accelerator.wait_for_everyone()
