@@ -554,6 +554,8 @@ class Generator(torch.nn.Module):
 
 #----------------------------------------------------------------------------
 
+
+
 @persistence.persistent_class
 class DiscriminatorBlock(torch.nn.Module):
     def __init__(self,
@@ -635,7 +637,7 @@ class DiscriminatorBlock(torch.nn.Module):
             x = self.conv0(x)
             x = self.conv1(x)
 
-        assert x.dtype == dtype
+        # assert x.dtype == dtype
         return x, img
 
     def extra_repr(self):
