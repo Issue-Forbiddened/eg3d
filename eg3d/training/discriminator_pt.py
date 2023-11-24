@@ -1,138 +1,127 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from torch_utils import misc
-class Conv2dLayer(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True, gain=1, use_wscale=False, lrmul=1, activation=None, conv_clamp=None):
-        super().__init__()
-        self.conv_clamp = conv_clamp
-        self.activation = activation
-        
-        he_std = gain / np.sqrt(in_channels * kernel_size ** 2)  # He initialization std
-        # Equalized learning rate and custom learning rate multiplier.
-        init_std = 1.0 / lrmul
-        self.scale = he_std * lrmul
-        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size) * init_std)
-        
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(out_channels))
-            self.bias_gain = lrmul
-        else:
-            self.bias = None
+import torch
+from torchvision.models import vgg19
+import math
+
+
+class FeatureExtractor(nn.Module):
+    def __init__(self):
+        super(FeatureExtractor, self).__init__()
+        vgg19_model = vgg19(pretrained=True)
+        self.vgg19_54 = nn.Sequential(*list(vgg19_model.features.children())[:35])
+
+    def forward(self, img):
+        return self.vgg19_54(img)
+
+
+class DenseResidualBlock(nn.Module):
+    """
+    The core module of paper: (Residual Dense Network for Image Super-Resolution, CVPR 18)
+    """
+
+    def __init__(self, filters, res_scale=0.2):
+        super(DenseResidualBlock, self).__init__()
+        self.res_scale = res_scale
+
+        def block(in_features, non_linearity=True):
+            layers = [nn.Conv2d(in_features, filters, 3, 1, 1, bias=True)]
+            if non_linearity:
+                layers += [nn.LeakyReLU()]
+            return nn.Sequential(*layers)
+
+        self.b1 = block(in_features=1 * filters)
+        self.b2 = block(in_features=2 * filters)
+        self.b3 = block(in_features=3 * filters)
+        self.b4 = block(in_features=4 * filters)
+        self.b5 = block(in_features=5 * filters, non_linearity=False)
+        self.blocks = [self.b1, self.b2, self.b3, self.b4, self.b5]
 
     def forward(self, x):
-        w = self.weight * self.scale
-        b = self.bias
-        if b is not None:
-            b = b * self.bias_gain
-        x = F.conv2d(x, w, b, padding=self.padding, stride=self.stride)
-        if self.activation:
-            x = F.leaky_relu(x, 0.2)
-        if self.conv_clamp:
-            x = x.clamp(-self.conv_clamp, self.conv_clamp)
-        return x
+        inputs = x
+        for block in self.blocks:
+            out = block(inputs)
+            inputs = torch.cat([inputs, out], 1)
+        return out.mul(self.res_scale) + x
 
-class DiscriminatorBlock(nn.Module):
-    def __init__(self, in_channels, tmp_channels, out_channels, resolution, img_channels, first_layer_idx, architecture='resnet', activation='lrelu', conv_clamp=None, use_fp16=False, fp16_channels_last=False, freeze_layers=0):
-        super().__init__()
-        self.resolution = resolution
-        self.architecture = architecture
-        self.channels_last = fp16_channels_last
 
-        # FromRGB layer if needed
-        if in_channels == 0 or architecture == 'skip':
-            self.fromrgb = Conv2dLayer(img_channels, tmp_channels, kernel_size=1, bias=True, activation=activation, conv_clamp=conv_clamp)
-
-        # Main layers
-        self.conv0 = Conv2dLayer(tmp_channels, tmp_channels, kernel_size=3, bias=True, activation=activation, conv_clamp=conv_clamp)
-        self.conv1 = Conv2dLayer(tmp_channels, out_channels, kernel_size=3, bias=True, activation=activation, conv_clamp=conv_clamp)
-
-        # Skip layer for the 'resnet' architecture
-        if architecture == 'resnet':
-            self.skip = nn.Conv2d(tmp_channels, out_channels, kernel_size=1, stride=2, padding=0, bias=False)
-
-    def forward(self, x, img):
-
-        # FromRGB
-        if self.in_channels == 0 or self.architecture == 'skip':
-            img = self.fromrgb(img)
-            x = x + img if x is not None else img
-
-        # Main convolutions
-        if self.architecture == 'resnet' and x is not None:
-            y = F.avg_pool2d(x, kernel_size=2, stride=2)  # Downsample
-            y = self.skip(y)
-            x = self.conv0(x)
-            x = self.conv1(x)
-            x = (x + y) / np.sqrt(2)  # Scale the residuals
-        else:
-            x = self.conv0(x)
-            x = F.avg_pool2d(x, kernel_size=2, stride=2)  # Downsample
-            x = self.conv1(x)
-
-        return x
-
-class MinibatchStdLayer(torch.nn.Module):
-    def __init__(self, group_size, num_channels=1):
-        super().__init__()
-        self.group_size = group_size
-        self.num_channels = num_channels
+class ResidualInResidualDenseBlock(nn.Module):
+    def __init__(self, filters, res_scale=0.2):
+        super(ResidualInResidualDenseBlock, self).__init__()
+        self.res_scale = res_scale
+        self.dense_blocks = nn.Sequential(
+            DenseResidualBlock(filters), DenseResidualBlock(filters), DenseResidualBlock(filters)
+        )
 
     def forward(self, x):
-        N, C, H, W = x.shape
-        with misc.suppress_tracer_warnings(): # as_tensor results are registered as constants
-            G = torch.min(torch.as_tensor(self.group_size), torch.as_tensor(N)) if self.group_size is not None else N
-        F = self.num_channels
-        c = C // F
+        return self.dense_blocks(x).mul(self.res_scale) + x
 
-        y = x.reshape(G, -1, F, c, H, W)    # [GnFcHW] Split minibatch N into n groups of size G, and channels C into F groups of size c.
-        y = y - y.mean(dim=0)               # [GnFcHW] Subtract mean over group.
-        y = y.square().mean(dim=0)          # [nFcHW]  Calc variance over group.
-        y = (y + 1e-8).sqrt()               # [nFcHW]  Calc stddev over group.
-        y = y.mean(dim=[2,3,4])             # [nF]     Take average over channels and pixels.
-        y = y.reshape(-1, F, 1, 1)          # [nF11]   Add missing dimensions.
-        y = y.repeat(G, 1, H, W)            # [NFHW]   Replicate over group and pixels.
-        x = torch.cat([x, y], dim=1)        # [NCHW]   Append to input as new channels.
-        return x
 
-    def extra_repr(self):
-        return f'group_size={self.group_size}, num_channels={self.num_channels:d}'
+class GeneratorRRDB(nn.Module):
+    def __init__(self, channels, filters=64, num_res_blocks=16, num_upsample=2):
+        super(GeneratorRRDB, self).__init__()
 
-class FullyConnectedLayer(nn.Module):
-    def __init__(self,
-                 in_features,                # Number of input features.
-                 out_features,               # Number of output features.
-                 bias=True,                  # Apply additive bias before the activation function?
-                 activation='linear',        # Activation function: 'relu', 'lrelu', etc.
-                 lr_multiplier=1,            # Learning rate multiplier.
-                 bias_init=0,                # Initial value for the additive bias.
-                 ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.activation = activation
-        self.lr_multiplier = lr_multiplier
-
-        # Initialize weights and biases
-        he_std = np.sqrt(2) / np.sqrt(in_features)  # He initialization std
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) * he_std * lr_multiplier)
-        if bias:
-            self.bias = nn.Parameter(torch.full((out_features,), bias_init * lr_multiplier))
-        else:
-            self.bias = None
+        # First layer
+        self.conv1 = nn.Conv2d(channels, filters, kernel_size=3, stride=1, padding=1)
+        # Residual blocks
+        self.res_blocks = nn.Sequential(*[ResidualInResidualDenseBlock(filters) for _ in range(num_res_blocks)])
+        # Second conv layer post residual blocks
+        self.conv2 = nn.Conv2d(filters, filters, kernel_size=3, stride=1, padding=1)
+        # Upsampling layers
+        upsample_layers = []
+        for _ in range(num_upsample):
+            upsample_layers += [
+                nn.Conv2d(filters, filters * 4, kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU(),
+                nn.PixelShuffle(upscale_factor=2),
+            ]
+        self.upsampling = nn.Sequential(*upsample_layers)
+        # Final output block
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(filters, filters, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(),
+            nn.Conv2d(filters, channels, kernel_size=3, stride=1, padding=1),
+        )
 
     def forward(self, x):
-        # Apply the linear transformation
-        x = F.linear(x, self.weight, self.bias)
+        out1 = self.conv1(x)
+        out = self.res_blocks(out1)
+        out2 = self.conv2(out)
+        out = torch.add(out1, out2)
+        out = self.upsampling(out)
+        out = self.conv3(out)
+        return out
 
-        # Apply activation function
-        if self.activation == 'lrelu':
-            x = F.leaky_relu(x, negative_slope=0.2)
-        elif self.activation == 'relu':
-            x = F.relu(x)
 
-        return x
+class Discriminator(nn.Module):
+    def __init__(self, input_shape):
+        super(Discriminator, self).__init__()
 
-    def extra_repr(self):
-        return f'in_features={self.in_features}, out_features={self.out_features}, activation={self.activation}'
+        self.input_shape = input_shape
+        in_channels, in_height, in_width = self.input_shape
+        patch_h, patch_w = int(in_height / 2 ** 4), int(in_width / 2 ** 4)
+        self.output_shape = (1, patch_h, patch_w)
+
+        def discriminator_block(in_filters, out_filters, first_block=False):
+            layers = []
+            layers.append(nn.Conv2d(in_filters, out_filters, kernel_size=3, stride=1, padding=1))
+            if not first_block:
+                layers.append(nn.BatchNorm2d(out_filters))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            layers.append(nn.Conv2d(out_filters, out_filters, kernel_size=3, stride=2, padding=1))
+            layers.append(nn.BatchNorm2d(out_filters))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        layers = []
+        in_filters = in_channels
+        for i, out_filters in enumerate([64, 128, 256, 512]):
+            layers.extend(discriminator_block(in_filters, out_filters, first_block=(i == 0)))
+            in_filters = out_filters
+
+        layers.append(nn.Conv2d(out_filters, 1, kernel_size=3, stride=1, padding=1))
+
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, img):
+        return self.model(img)

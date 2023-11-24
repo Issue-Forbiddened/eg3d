@@ -52,10 +52,13 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 import lpips
 from torchvision import transforms
-from transformers import  CLIPVisionModelWithProjection
+from transformers import  CLIPVisionModelWithProjection,CLIPTextModel,CLIPTokenizer,CLIPModel
+from training.dual_discriminator import DualDiscriminator_Mine
 
+from accelerate.utils import AutocastKwargs
 import cv2
 import pdb
+import time
 # import matplotlib.pyplot as plt
 #----------------------------------------------------------------------------
 
@@ -587,6 +590,12 @@ def parse_args():
     # adv
     parser.add_argument("--adv", action="store_true", help="Whether to adversarial training.")
 
+    # verify_text str
+    parser.add_argument("--verify_text", type=str, default='', help="The text to verify.")
+
+    # additional_sample int
+    parser.add_argument("--additional_sample", type=int, default=0, help="The additional sample to generate.")
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -631,7 +640,7 @@ def forward_process(latent2img_fn,timesteps,noise_scheduler,latents,noise):
 
 def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder_states,
                     camera_params,G,latent_guidance=None,lpips_fn=None,eg3doutput=None,
-                    inv_normalize_fn=None,reverse_type='normal',return_pred=False,return_latents=False):
+                    inv_normalize_fn=None,reverse_type='normal',return_pred=False,return_latents=False,i_end=50):
     reverse_process_list=[]
     latents=latents.detach().clone()
     reverse_process_list.append(latent2img_fn(latents))
@@ -653,7 +662,7 @@ def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder
                     pred=unet(latents,t,encoder_states,return_dict=False)[0] 
                     pred_non_con=unet(latents,t,encoder_states_none,return_dict=False)[0]
                     guidance_grad=latent_guidance(pred,camera_params,G,lpips_fn,eg3doutput,inv_normalize_fn)
-                    pred=pred+3.0*(pred-pred_non_con)
+                    pred=pred+2.0*(pred-pred_non_con)
                     pred=pred-1e4*guidance_grad*sigmas.expand_as(guidance_grad)
                     pred_dict=noise_scheduler.step(pred, t, latents, return_dict=True)
                     pred_epsilon=pred_dict.pred_epsilon
@@ -672,7 +681,7 @@ def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder
                 for langevin_step_idx in range(10):
                     pred=unet(latents,t,encoder_states,return_dict=False)[0] 
                     pred_non_con=unet(latents,t,encoder_states_none,return_dict=False)[0]
-                    pred=pred+3.0*(pred-pred_non_con)
+                    pred=pred+2.0*(pred-pred_non_con)
                     pred_dict=noise_scheduler.step(pred, t, latents, return_dict=True)
                     pred_epsilon=pred_dict.pred_epsilon
                     latents=latents+(-0.5*step_size*pred_epsilon+torch.randn_like(pred_epsilon)*(step_size**0.5))*sigmas.expand_as(pred_epsilon)
@@ -849,10 +858,13 @@ def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder
             latents=noise_scheduler.step(pred_guidance_interpolate, t, latents, return_dict=False)[0]
             pred=pred_guidance_interpolate
 
-        if i%5==0 or i==len(timesteps)-1:
+        if i%10==0 or i==len(timesteps)-1:
             if return_pred:
                 reverse_process_list.append(latent2img_fn(pred))
             reverse_process_list.append(latent2img_fn(latents))
+        if i==i_end:
+            latents=pred
+            break
     if not return_latents:
         return reverse_process_list
     else:
@@ -928,7 +940,8 @@ def generate_images():
     #                             }
 
     # encoder=Encoder(**encoder_config)
-    encoder=CLIPVisionModelWithProjection.from_pretrained("lambdalabs/sd-image-variations-diffusers",subfolder='image_encoder').to(device)
+    encoder=CLIPVisionModelWithProjection.from_pretrained("lambdalabs/sd-image-variations-diffusers",
+                    subfolder='image_encoder').to(device) #这个就是"openai/clip-vit-large-patch14"的image_encoder
     encoder.requires_grad_(False)
     clip_normalize_fn=transforms.Compose([
         transforms.Resize(
@@ -941,6 +954,24 @@ def generate_images():
         [0.26862954, 0.26130258, 0.27577711]),
     ])
 
+    if args.verify_text:
+        # text_encoder=CLIPTextModel.from_pretrained('CompVis/stable-diffusion-v1-4',subfolder='text_encoder').to(device)
+        # text_encoder.requires_grad_(False)
+        clip=CLIPModel.from_pretrained('openai/clip-vit-large-patch14').to(device)
+        tokenizer=CLIPTokenizer.from_pretrained('CompVis/stable-diffusion-v1-4',subfolder='tokenizer')
+        with torch.no_grad():
+            text_inputs = tokenizer(
+                args.verify_text,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            text_input_ids = text_inputs.input_ids
+            # prompt_embeds = text_encoder(text_input_ids.to(text_encoder.device))[0] # (1,77,768)
+            prompt_embeds = clip.get_text_features(text_input_ids.to(clip.device)) # (1,768)
+            prompt_embeds=prompt_embeds/torch.norm(prompt_embeds,dim=-1,keepdim=True)
+
     # if args.use_ema:
     #     ema_encoder = EMAModel(encoder.parameters(), model_cls=CLIPVisionModelWithProjection,model_config=encoder.config)
 
@@ -950,6 +981,7 @@ def generate_images():
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
+            # SAVE
             if accelerator.is_main_process:
                 if args.use_ema:
                     # ema_encoder.save_pretrained(os.path.join(output_dir, "encoder_ema"))
@@ -964,6 +996,7 @@ def generate_images():
                     weights.pop()
 
         def load_model_hook(models, input_dir):
+            # LOAD
             if args.use_ema:
                 load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel_downsample)
                 ema_unet.load_state_dict(load_model.state_dict())
@@ -1178,6 +1211,29 @@ def generate_images():
 
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
+            if args.adv and os.path.exists(os.path.join(args.output_dir, path, "discriminator")):
+                logger.info(f"Loading discriminator from {os.path.join(args.output_dir, path, 'discriminator')}")
+                input_dir=os.path.join(args.output_dir, path)
+                load_model = DualDiscriminator_Mine.from_pretrained(os.path.join(input_dir,"discriminator"))
+                D.register_to_config(**load_model.config)
+                D.load_state_dict(load_model.state_dict())
+                del load_model
+
+                logger.info(f"Loading discriminator optimizer from {os.path.join(args.output_dir, path, 'discriminator')}")
+                optimizer_name=f"optimizer_D_{global_step}.bin"
+                input_optimizer_file = os.path.join(input_dir, "discriminator", optimizer_name)
+                optimizer_state = torch.load(input_optimizer_file, map_location=device)
+                optimizer_D.load_state_dict(optimizer_state)
+                del optimizer_state
+
+                logger.info(f"Loading discriminator lr_scheduler from {os.path.join(args.output_dir, path, 'discriminator')}")
+                lr_scheduler_name=f"lr_scheduler_D_{global_step}.bin"
+                input_scheduler_file = os.path.join(input_dir, "discriminator", lr_scheduler_name)
+                scheduler_state=torch.load(input_scheduler_file, map_location=device)
+                lr_scheduler_D.load_state_dict(scheduler_state)
+                del scheduler_state
+                del input_dir
+
 
     else:
         initial_global_step = 0
@@ -1187,10 +1243,6 @@ def generate_images():
     #     optimizer, lr_scheduler
     # )
 
-    # if args.adv:
-    #     D, optimizer_D, lr_scheduler_D = accelerator.prepare(
-    #         D, optimizer_D, lr_scheduler_D
-    #     )
     if accelerator.is_main_process:
         for file_idx in range(0,1000000):
             if not os.path.exists(os.path.join(args.output_dir,"train_control3diff_tmp_{}.py".format(str(file_idx)))):
@@ -1331,7 +1383,7 @@ def generate_images():
 
     pitch_range = 0.25
     yaw_range = 0.35
-    frames=9
+    frames=50
     camera_params_val_list=[]
     for frame_idx in range(frames):
         cam2world_pose_val = LookAtPoseSampler.sample(3.14/2 + yaw_range * np.sin(2 * 3.14 * frame_idx / (frames)),
@@ -1340,7 +1392,6 @@ def generate_images():
                                             radius=G.rendering_kwargs['avg_camera_radius'], device=device,batch_size=args.train_batch_size)
         camera_params_val = torch.cat([cam2world_pose_val.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose_val.shape[0],1)], 1)
         camera_params_val_list.append(camera_params_val)
-
 
 
     for epoch in tqdm(range(first_epoch, args.num_train_epochs),desc='epoch:',disable=not accelerator.is_main_process):
@@ -1383,7 +1434,8 @@ def generate_images():
                 encoder_states=[torch.zeros(encoder_output_shape[i],device=device,dtype=noisy_latents.dtype) for i in range(len(encoder_output_shape))]
                 none_condition=True
             else:
-                encoder_states=encoder(clip_normalize_fn(eg3doutput['image'].detach())).image_embeds.unsqueeze(1)
+                encoder_states=encoder(clip_normalize_fn(eg3doutput['image'].detach())).image_embeds.unsqueeze(1) # image_embeds: (batch_size, 768)
+                encoder_states=encoder_states/encoder_states.norm(dim=-1,keepdim=True)
                 encoder_states=encoder_states.unsqueeze(0).repeat(num_cross_attention_block,1,1,1)
                 if encoder_output_shape is None:
                     encoder_output_shape=[state.shape for state in encoder_states]
@@ -1398,51 +1450,55 @@ def generate_images():
 
             losses['loss_diff']=loss_diff
 
-            if args.recon and not none_condition:
+            if args.recon:
                 denoised_output_recon=G.render_from_planes(camera_params,inv_normalize_fn(unet_output.sample))
-                for k,v in eg3doutput.items():
-                    losses['loss_{}'.format(k)]=F.mse_loss(v,denoised_output_recon[k])
-                    if k=='image' or k=='image_raw':
-                        losses['loss_{}_lpips'.format(k)]=lpips_fn(v,denoised_output_recon[k]).mean()   
+                # for k,v in eg3doutput.items():
+                #     losses['loss_{}'.format(k)]=F.mse_loss(v,denoised_output_recon[k])
+                #     if k=='image' or k=='image_raw':
+                #         losses['loss_{}_lpips'.format(k)]=lpips_fn(v,denoised_output_recon[k]).mean()   
                 if args.adv:
-                    # eg3doutput_={k:v.detach().requires_grad_(True) for k,v in eg3doutput.items()}
-                    logits_real_recon=D(eg3doutput,camera_params)
+                    eg3doutput_={k:v.detach().requires_grad_(True) for k,v in eg3doutput.items()}
+
+                    logits_real_recon=D(eg3doutput_,camera_params)
                     logits_fake_recon=D(denoised_output_recon,camera_params)
                     loss_adv_real_recon=F.softplus(-logits_real_recon).mean()
                     loss_adv_fake_recon=F.softplus(logits_fake_recon).mean()
                     losses['loss_adv_real_recon']=loss_adv_real_recon
                     losses['loss_adv_fake_recon']=loss_adv_fake_recon
                     
-                    # r1_grads_recon = torch.autograd.grad(outputs=[logits_real_recon.sum()], inputs=[eg3doutput_['image'], 
-                    #                                             eg3doutput_['image_raw']], create_graph=True, only_inputs=True)
-                    # r1_grads_image_recon = r1_grads_recon[0]
-                    # r1_grads_image_raw_recon = r1_grads_recon[1]
-                    # r1_penalty_recon = r1_grads_image_recon.square().sum([1,2,3]) + r1_grads_image_raw_recon.square().sum([1,2,3])
-                    # loss_r1_recon = r1_penalty_recon.mean()
-                    # losses['loss_r1_recon']=loss_r1_recon
+                    r1_grads_recon = torch.autograd.grad(outputs=[logits_real_recon.sum()], inputs=[eg3doutput_['image'], 
+                                                                eg3doutput_['image_raw']], create_graph=True, only_inputs=True)
+                    r1_grads_image_recon = r1_grads_recon[0]
+                    r1_grads_image_raw_recon = r1_grads_recon[1]
+                    r1_penalty_recon = r1_grads_image_recon.square().sum([1,2,3]) + r1_grads_image_raw_recon.square().sum([1,2,3])
+                    loss_r1_recon = r1_penalty_recon.mean()
+                    losses['loss_r1_recon']=loss_r1_recon
 
-            if args.multiview and not none_condition:
+            if args.multiview:
                 denoised_output_mv=G.render_from_planes(camera_params_mv,inv_normalize_fn((unet_output.sample).repeat(mv_number,1,1,1)))
-                for k,v in eg3doutput_mv.items():
-                    losses['loss_{}_mv'.format(k)]=F.mse_loss(v,denoised_output_mv[k])
-                    if k=='image' or k=='image_raw':
-                        losses['loss_{}_lpips_mv'.format(k)]=lpips_fn(v,denoised_output_mv[k]).mean()
+                # for k,v in eg3doutput_mv.items():
+                #     losses['loss_{}_mv'.format(k)]=F.mse_loss(v,denoised_output_mv[k])
+                #     if k=='image' or k=='image_raw':
+                #         losses['loss_{}_lpips_mv'.format(k)]=lpips_fn(v,denoised_output_mv[k]).mean()
                 if args.adv:
-                    # eg3doutput_mv_={k:v.detach().requires_grad_(True) for k,v in eg3doutput_mv.items()}
-                    logits_real_mv=D(eg3doutput_mv,camera_params_mv)
+                    # use fp32 for discriminator
+                    # with accelerator.autocast(autocast_handler=custom_autocast_handler):
+                    eg3doutput_mv_={k:v.detach().requires_grad_(True) for k,v in eg3doutput_mv.items()}
+                    # denoised_output_mv_={k:v.detach().float() for k,v in denoised_output_mv.items()}
+                    logits_real_mv=D(eg3doutput_mv_,camera_params_mv)
                     logits_fake_mv=D(denoised_output_mv,camera_params_mv)
                     loss_adv_real_mv=F.softplus(-logits_real_mv).mean()
                     loss_adv_fake_mv=F.softplus(logits_fake_mv).mean()
                     losses['loss_adv_real_mv']=loss_adv_real_mv
                     losses['loss_adv_fake_mv']=loss_adv_fake_mv
 
-                    # r1_grads_mv = torch.autograd.grad(outputs=[logits_real_mv.sum()], 
-                    #                     inputs=[eg3doutput_mv_['image'], eg3doutput_mv_['image_raw']], create_graph=True, only_inputs=True)
-                    # r1_grads_image_mv = r1_grads_mv[0]
-                    # r1_grads_image_raw_mv = r1_grads_mv[1]
-                    # r1_penalty_mv = r1_grads_image_mv.square().sum([1,2,3]) + r1_grads_image_raw_mv.square().sum([1,2,3])
-                    # loss_r1_mv = r1_penalty_mv.mean()
-                    # losses['loss_r1_mv']=loss_r1_mv
+                    r1_grads_mv = torch.autograd.grad(outputs=[logits_real_mv.sum()], 
+                                        inputs=[eg3doutput_mv_['image'], eg3doutput_mv_['image_raw']], create_graph=True, only_inputs=True)
+                    r1_grads_image_mv = r1_grads_mv[0]
+                    r1_grads_image_raw_mv = r1_grads_mv[1]
+                    r1_penalty_mv = r1_grads_image_mv.square().sum([1,2,3]) + r1_grads_image_raw_mv.square().sum([1,2,3])
+                    loss_r1_mv = r1_penalty_mv.mean()
+                    losses['loss_r1_mv']=loss_r1_mv
 
 
 
@@ -1463,10 +1519,27 @@ def generate_images():
             train_loss += avg_loss.item() / args.gradient_accumulation_steps
             accelerator.backward(loss)
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(list(unet.parameters())+list(encoder.parameters()), args.max_grad_norm)
+                accelerator.clip_grad_norm_(list(unet.parameters()), args.max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
+            
+            if args.adv:
+                # 测试过，通信良好的时候这样的同步不怎么会花时间
+                params = [param for param in D.parameters() if param.numel() > 0 and param.grad is not None]
+                if len(params) > 0:
+                    flat = torch.cat([param.grad.flatten() for param in params])
+                    if accelerator.num_processes > 1:
+                        torch.distributed.all_reduce(flat)
+                        flat /= accelerator.num_processes
+                    misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
+                    grads = flat.split([param.numel() for param in params])
+                    for param, grad in zip(params, grads):
+                        param.grad = grad.reshape(param.shape)
+                optimizer_D.step()
+                lr_scheduler_D.step()
+                optimizer_D.zero_grad()
+
             if accelerator.sync_gradients:
                 if args.use_ema:
                     ema_unet.step(unet.parameters())
@@ -1476,6 +1549,7 @@ def generate_images():
                 accelerator.log({"cosine_similarity": loss_cosine_similarity}, step=global_step)
                 train_loss = 0.0
 
+                # if global_step % args.checkpointing_steps == 0 or not sanity_checked:
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
@@ -1497,11 +1571,22 @@ def generate_images():
                                 for removing_checkpoint in removing_checkpoints:
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
-
+                        
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
                         shutil.copy(os.path.join(args.output_dir,"train_control3diff_tmp_{}.py".format(str(file_idx))), save_path)
+
+                        if args.adv:
+                            # save D
+                            D.save_pretrained(os.path.join(save_path,"discriminator"))
+                            # save optimizer_D
+                            torch.save(optimizer_D.state_dict(), os.path.join(save_path,'discriminator',f"optimizer_D_{global_step}.bin"))
+                            # save lr_scheduler_D
+                            torch.save(lr_scheduler_D.state_dict(), os.path.join(save_path,'discriminator',f"lr_scheduler_D_{global_step}.bin"))
+                        # if not sanity_checked:
+                        #     shutil.rmtree(save_path)
+
 
             if global_step%log_step_interval==0 or not sanity_checked:
                 if accelerator.is_main_process:
@@ -1524,6 +1609,7 @@ def generate_images():
                             encoder_val=encoder
 
                             encoder_states=encoder_val(clip_normalize_fn(eg3doutput['image'].detach())).image_embeds.unsqueeze(1).unsqueeze(0).repeat(num_cross_attention_block,1,1,1)
+                            encoder_states=encoder_states/encoder_states.norm(dim=-1,keepdim=True)
                             unet_output=unet_val(noisy_latents,timesteps,encoder_states)     
                             eg3doutput_denoised_ema=latent2img_fn(unet_output.sample)
                             img_concat=torch.cat([img_concat, eg3doutput_denoised_ema],dim=2)  
@@ -1540,43 +1626,124 @@ def generate_images():
                             latents=noise.detach().clone()
 
 
-
                             forward_process_list=forward_process(latent2img_fn,timesteps,noise_scheduler,original_latents,noise)
                             forward_process_list=torch.cat(forward_process_list,dim=2).flatten(0,1)
-                            accelerator.log({'forward_process':wandb.Image(forward_process_list.numpy())},step=global_step)
+                            # accelerator.log({'forward_process':wandb.Image(forward_process_list.numpy())},step=global_step)
 
                             reverse_process_list,denoised_ddim=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
                                                                  G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='normal',return_pred=True,return_latents=True)
                             eg3doutput_denoised_ema_multistep=reverse_process_list[-1]
                             img_concat=torch.cat([img_concat, eg3doutput_denoised_ema_multistep],dim=2)
                             reverse_process_list=torch.cat(reverse_process_list,dim=2).flatten(0,1)
-                            accelerator.log({'reverse_process':wandb.Image(reverse_process_list.numpy())},step=global_step)
+                            # accelerator.log({'reverse_process':wandb.Image(reverse_process_list.numpy())},step=global_step)
                             del reverse_process_list
 
                             reverse_guidance_process_list,denoised_ddim_cfg=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
                                                                           G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='cfg',return_pred=True,return_latents=True)
                             reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
-                            accelerator.log({'reverse_guidance_process_cfg':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+                            # accelerator.log({'reverse_guidance_process_cfg':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
 
                             # reverse_guidance_process_list,denoised_ddim_guided_ori=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
                             #                                               G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='vgg_guidance_0',return_pred=True,return_latents=True)
                             # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
                             # accelerator.log({'reverse_guidance_process_original':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+                            if args.verify_text:
+                                encoder_states_text=prompt_embeds.unsqueeze(0).unsqueeze(0).repeat(num_cross_attention_block,noise.shape[0],1,1)
+                                reverse_guidance_process_list_text,denoised_ddim_cfg_text=\
+                                    reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states_text,camera_params,
+                                                    G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='normal',return_pred=True,
+                                                    return_latents=True)
+                                reverse_guidance_process_list_text=torch.cat(reverse_guidance_process_list_text,dim=2).flatten(0,1)
+                                # accelerator.log({'reverse_guidance_process_normal_text':wandb.Image(reverse_guidance_process_list_text.numpy())},step=global_step)
 
-                            # reverse_guidance_process_list,reverse_guidance_process_g_cfg_langevin=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
-                            #                                               G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='langevin_correct',return_pred=True,return_latents=True)
-                            # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
-                            # accelerator.log({'reverse_guidance_process_g_cfg_langevin':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+                                if args.additional_sample:
+                                    reverse_process_list_text=[]
+                                    denoised_ddim_text=[]
+                                    for i in range(0,args.additional_sample,noise.shape[0]):
+                                        noise_sample=torch.randn_like(noise)
+                                        reverse_process_list_text_split,denoised_ddim_text_split=\
+                                                reverse_process(latent2img_fn,timesteps,noise_scheduler,noise_sample,unet_val,encoder_states_text,camera_params,
+                                                                G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='normal',return_pred=True,
+                                                                return_latents=True,i_end=40)
+                                        denoised_ddim_text.append(denoised_ddim_text_split)
+                                    # denoised_ddim_text shape: (additional_sample//batch_size, batch_size, 96, 256, 256)
 
-                            # reverse_guidance_process_list,reverse_guidance_process_cfg_langevin=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
-                            #                                               G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='langevin_correct1',return_pred=True,return_latents=True)
-                            # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
-                            # accelerator.log({'reverse_guidance_process_cfg_langevin':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+                                    multiview_image_list=[]
+                                    for camera_param_val in camera_params_val_list:
+                                        multiview_image_list_per_frame=[]
+                                        for denoised_ddim_text_split in denoised_ddim_text:
+                                            denoised_img=latent2img_fn(denoised_ddim_text_split,camera_param_val).numpy()  # (batch_size,256,256,3)
+                                            multiview_image_list_per_frame.append(denoised_img)
+                                        multiview_image_list.append(np.concatenate(multiview_image_list_per_frame,axis=0)) # (additional_sample,256,256,3)
 
-                            # reverse_guidance_process_list,reverse_guidance_process_g_langevin=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
-                            #                                               G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='langevin_correct2',return_pred=True,return_latents=True)
-                            # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
-                            # accelerator.log({'reverse_guidance_process_g_langevin.':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+                                    # multiview_image_list: (frames,additional_sample,256,256,3)
+                                    # change to square: (additional_sample,256,256,3) --> ((additional_sample**0.5)*256,256*(additional_sample**0.5),3)
+                                    multiview_image_list=np.stack(multiview_image_list,axis=0) # (frames,additional_sample,256,256,3)
+
+                                    sqrt_additional_sample=int(np.sqrt(args.additional_sample))
+                                    assert sqrt_additional_sample*sqrt_additional_sample==args.additional_sample,'additional_sample must be square number'
+                                    multiview_image_list=multiview_image_list.reshape(multiview_image_list.shape[0],sqrt_additional_sample,sqrt_additional_sample,
+                                                                                      multiview_image_list.shape[2],multiview_image_list.shape[3],multiview_image_list.shape[4])
+                                    multiview_image_list=multiview_image_list.swapaxes(2,3) # (frames,sqrt_additional_sample,256,sqrt_additional_sample,256,3)
+                                    multiview_image_list=multiview_image_list.reshape(multiview_image_list.shape[0],sqrt_additional_sample*multiview_image_list.shape[2],
+                                                                                        sqrt_additional_sample*multiview_image_list.shape[4],3) # (frames,sqrt_additional_sample*256,sqrt_additional_sample*256,3)
+                                    
+                                    original_prompt_with_line=args.verify_text.replace(' ','_')
+                                    accelerator.log({f'reverse_process_normal_text_additional_sample_prompt_{original_prompt_with_line}':wandb.Image(reverse_guidance_process_list_text[0].numpy())},step=global_step)
+
+                                    frame_height, frame_width = multiview_image_list.shape[1], multiview_image_list.shape[2]
+                                    video_fps = 25.0
+
+                                    # Define the codec and create VideoWriter object
+                                    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                                    
+                                    out = cv2.VideoWriter(os.path.join(args.output_dir,
+                                                                       'output_video_{}_additional_sample_prompt_{}.avi'.format(str(global_step),original_prompt_with_line)), 
+                                                                       fourcc, video_fps, (frame_width, frame_height))
+
+                                    # Iterate over each frame and write it to the video
+                                    for i in range(multiview_image_list.shape[0]):
+                                        frame = multiview_image_list[i]
+
+                                        # OpenCV expects uint8 data in BGR format
+                                        frame_bgr = cv2.cvtColor(frame.astype(np.uint8), cv2.COLOR_RGB2BGR)
+                                        out.write(frame_bgr)
+
+                                    # Release the VideoWriter object
+                                    out.release()
+
+                                # encoder_states_text=prompt_embeds.unsqueeze(0).unsqueeze(0).repeat(num_cross_attention_block,noise.shape[0],1,1)
+                                # reverse_guidance_process_list_text,denoised_ddim_cfg_text=\
+                                #     reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,10*encoder_states_text,camera_params,
+                                #                     G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='normal',return_pred=True,
+                                #                     return_latents=True)
+                                # reverse_guidance_process_list_text=torch.cat(reverse_guidance_process_list_text,dim=2).flatten(0,1)
+                                # accelerator.log({'reverse_guidance_process_normal_text_scale_10':wandb.Image(reverse_guidance_process_list_text.numpy())},step=global_step)
+
+                            if args.test_video:
+                                # reverse_guidance_process_list,reverse_guidance_process_g_cfg_langevin=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
+                                #                                             G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='langevin_correct',return_pred=True,return_latents=True)
+                                # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
+                                # accelerator.log({'reverse_guidance_process_g_cfg_langevin':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+
+                                # reverse_guidance_process_list,reverse_guidance_process_cfg_langevin=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
+                                #                                             G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='langevin_correct1',return_pred=True,return_latents=True)
+                                # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
+                                # accelerator.log({'reverse_guidance_process_cfg_langevin':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+
+                                # reverse_guidance_process_list,reverse_guidance_process_g_langevin=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
+                                #                                             G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='langevin_correct2',return_pred=True,return_latents=True)
+                                # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
+                                # accelerator.log({'reverse_guidance_process_g_langevin.':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+                                if args.verify_text:
+                                    pass
+
+                                    # reverse_guidance_process_list_text,denoised_ddim_cfg_langevin_text=\
+                                    #     reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states_text,camera_params,
+                                    #                     G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='langevin_correct1',return_pred=True,
+                                    #                     return_latents=True)
+                                    # reverse_guidance_process_list_text=torch.cat(reverse_guidance_process_list_text,dim=2).flatten(0,1)
+                                    # accelerator.log({'reverse_guidance_process_cfg_langevin_text':wandb.Image(reverse_guidance_process_list_text.numpy())},step=global_step)
 
                             # reverse_guidance_process_list=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='vgg_guidance_1')
                             # reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
@@ -1657,18 +1824,18 @@ def generate_images():
                             # del multiview_image_list
 
  
-                            # # 首先，不同的encoder_states之间的相似度定义为里面每一个元素的相似度的算术平均
-                            # # 对于每一个元素，计算它和其他元素的相似度，然后取平均
-                            # cosine_similarity_val=torch.zeros((len(encoder_states),encoder_states[0].shape[0],encoder_states[0].shape[0]),device=device)
-                            # for i in range(len(encoder_states)):
-                            #     for j in range(0,len(encoder_states[i])):
-                            #         for k in range(j,len(encoder_states[i])):
-                            #             cosine_similarity_val[i,j,k]=F.cosine_similarity(encoder_states[i][j],encoder_states[i][k],dim=-1).mean()
-                            #         cosine_similarity_val[i,j,j]=1
-                            # cosine_similarity_val=cosine_similarity_val.mean(dim=0)
-                            # # save to txt as a matrix
-                            # cosine_similarity_val=cosine_similarity_val.cpu().numpy()
-                            # np.savetxt(os.path.join(args.output_dir,f'cosine_similarity_val_{global_step}.txt'),cosine_similarity_val)
+                            # 首先，不同的encoder_states之间的相似度定义为里面每一个元素的相似度的算术平均
+                            # 对于每一个元素，计算它和其他元素的相似度，然后取平均
+                            cosine_similarity_val=torch.zeros((len(encoder_states),encoder_states[0].shape[0],encoder_states[0].shape[0]),device=device)
+                            for i in range(len(encoder_states)):
+                                for j in range(0,len(encoder_states[i])):
+                                    for k in range(j,len(encoder_states[i])):
+                                        cosine_similarity_val[i,j,k]=F.cosine_similarity(encoder_states[i][j],encoder_states[i][k],dim=-1).mean()
+                                    cosine_similarity_val[i,j,j]=1
+                            cosine_similarity_val=cosine_similarity_val.mean(dim=0)
+                            # save to txt as a matrix
+                            cosine_similarity_val=cosine_similarity_val.cpu().numpy()
+                            np.savetxt(os.path.join(args.output_dir,f'cosine_similarity_val_{global_step}.txt'),cosine_similarity_val)
 
                             # 可视化注意力图
                             encoder_states_img=[encoder_state.reshape(-1,int(np.sqrt(encoder_state.shape[1])),int(np.sqrt(encoder_state.shape[1])),encoder_state.shape[-1]).permute(0,3,1,2) for encoder_state in encoder_states]
@@ -1688,11 +1855,15 @@ def generate_images():
                                     denoised_img=latent2img_fn(denoised_ddim,camera_param_val)
                                     denoised_cfg_img=latent2img_fn(denoised_ddim_cfg,camera_param_val)
                                     # denoised_guided_ori_img=latent2img_fn(denoised_ddim_guided_ori,camera_param_val)
-                                    denoised_guided_g_cfg_langevin_img=latent2img_fn(reverse_guidance_process_g_cfg_langevin,camera_param_val)
-                                    denoised_guided_cfg_langevin_img=latent2img_fn(reverse_guidance_process_cfg_langevin,camera_param_val)
-                                    denoised_guided_g_langevin_img=latent2img_fn(reverse_guidance_process_g_langevin,camera_param_val)
-                                    concat_img=torch.cat([original_img,denoised_img,denoised_cfg_img,denoised_guided_g_cfg_langevin_img,
-                                                          denoised_guided_cfg_langevin_img,denoised_guided_g_langevin_img
+                                    # denoised_guided_g_cfg_langevin_img=latent2img_fn(reverse_guidance_process_g_cfg_langevin,camera_param_val)
+                                    # denoised_guided_cfg_langevin_img=latent2img_fn(reverse_guidance_process_cfg_langevin,camera_param_val)
+                                    # denoised_guided_g_langevin_img=latent2img_fn(reverse_guidance_process_g_langevin,camera_param_val)
+                                    denoised_cfg_img_text=latent2img_fn(denoised_ddim_cfg_text,camera_param_val)
+                                    # denoised_cfg_langevin_img_text=latent2img_fn(denoised_ddim_cfg_langevin_text,camera_param_val)
+                                    concat_img=torch.cat([original_img,denoised_img,denoised_cfg_img,
+                                                        #   denoised_guided_g_cfg_langevin_img,denoised_guided_cfg_langevin_img,denoised_guided_g_langevin_img,
+                                                            denoised_cfg_img_text,
+                                                            # denoised_cfg_langevin_img_text,
                                                           ],dim=2).flatten(0,1).numpy() # in range 0-255, shape (batch_size*256,256*2,3)
                                     multiview_image_list.append(concat_img)
                                 # make video
@@ -1722,6 +1893,7 @@ def generate_images():
                         # save to wandb
                         accelerator.log({'origin_noised_denoised_denoisedema_(denoised_none_condition)_denoisedemamultistep':wandb.Image(img_concat.cpu().numpy())},step=global_step)
                         del img_concat, eg3doutput_,eg3doutput_noisy,eg3doutput_denoised
+                        # return
             sanity_checked=True
             accelerator.wait_for_everyone()
 

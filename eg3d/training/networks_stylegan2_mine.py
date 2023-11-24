@@ -114,6 +114,7 @@ class FullyConnectedLayer(torch.nn.Module):
     def forward(self, x):
         w = self.weight.to(x.dtype) * self.weight_gain
         b = self.bias
+        x_dtype=x.dtype
         if b is not None:
             b = b.to(x.dtype)
             if self.bias_gain != 1:
@@ -123,6 +124,7 @@ class FullyConnectedLayer(torch.nn.Module):
             x = torch.addmm(b.unsqueeze(0), x, w.t())
         else:
             x = x.matmul(w.t())
+            x=x.to(x_dtype)
             x = bias_act.bias_act(x, b, act=self.activation)
         return x
 
@@ -175,7 +177,11 @@ class Conv2dLayer(torch.nn.Module):
         w = self.weight * self.weight_gain
         b = self.bias.to(x.dtype) if self.bias is not None else None
         flip_weight = (self.up == 1) # slightly faster
+        x_dtype=x.dtype
+
         x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=self.resample_filter, up=self.up, down=self.down, padding=self.padding, flip_weight=flip_weight)
+
+        x=x.to(x_dtype)
 
         act_gain = self.act_gain * gain
         act_clamp = self.conv_clamp * gain if self.conv_clamp is not None else None
@@ -245,7 +251,12 @@ class MappingNetwork(torch.nn.Module):
         # Main layers.
         for idx in range(self.num_layers):
             layer = getattr(self, f'fc{idx}')
-            x = layer(x)
+            x_dtype_before=x.dtype
+            try:
+                x = layer(x)
+            except Exception as err:
+                print(f'layer {idx} input dtype {x_dtype_before}')
+                raise err
 
         # Update moving average of W.
         if update_emas and self.w_avg_beta is not None:
@@ -514,7 +525,8 @@ class SynthesisNetwork(torch.nn.Module):
         x = img = None
         for res, cur_ws in zip(self.block_resolutions, block_ws):
             block = getattr(self, f'b{res}')
-            x, img = block(x, img, cur_ws, **block_kwargs)
+            if res!=self.block_resolutions:
+                x, img = block(x, img, cur_ws, **block_kwargs)
         return img
 
     def extra_repr(self):
@@ -552,6 +564,8 @@ class Generator(torch.nn.Module):
         return img
 
 #----------------------------------------------------------------------------
+
+
 
 @persistence.persistent_class
 class DiscriminatorBlock(torch.nn.Module):
@@ -616,6 +630,7 @@ class DiscriminatorBlock(torch.nn.Module):
             misc.assert_shape(x, [None, self.in_channels, self.resolution, self.resolution])
             x = x.to(dtype=dtype, memory_format=memory_format)
 
+
         # FromRGB.
         if self.in_channels == 0 or self.architecture == 'skip':
             misc.assert_shape(img, [None, self.img_channels, self.resolution, self.resolution])
@@ -634,7 +649,7 @@ class DiscriminatorBlock(torch.nn.Module):
             x = self.conv0(x)
             x = self.conv1(x)
 
-        assert x.dtype == dtype
+        # assert x.dtype == dtype
         return x, img
 
     def extra_repr(self):

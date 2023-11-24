@@ -145,11 +145,16 @@ def _bias_act_cuda(dim=1, act='linear', alpha=None, gain=None, clamp=None):
         @staticmethod
         def forward(ctx, x, b): # pylint: disable=arguments-differ
             ctx.memory_format = torch.channels_last if x.ndim > 2 and x.stride(1) == 1 else torch.contiguous_format
+            x_dtype=x.dtype
             x = x.contiguous(memory_format=ctx.memory_format)
-            b = b.contiguous() if b is not None else _null_tensor
+            b = b.contiguous().to(x.dtype) if b is not None else _null_tensor.to(x.device, x.dtype)
             y = x
             if act != 'linear' or gain != 1 or clamp >= 0 or b is not _null_tensor:
-                y = _plugin.bias_act(x, b, _null_tensor, _null_tensor, _null_tensor, 0, dim, spec.cuda_idx, alpha, gain, clamp)
+                try:
+                    y = _plugin.bias_act(x, b, _null_tensor, _null_tensor, _null_tensor, 0, dim, spec.cuda_idx, alpha, gain, clamp)
+                except RuntimeError as err:
+                    print(f'bias_act_cuda(x_dtype={x_dtype} x.dtype={x.dtype}, b.dtype={b.dtype}')
+                    raise err
             ctx.save_for_backward(
                 x if 'x' in spec.ref or spec.has_2nd_grad else _null_tensor,
                 b if 'x' in spec.ref or spec.has_2nd_grad else _null_tensor,
