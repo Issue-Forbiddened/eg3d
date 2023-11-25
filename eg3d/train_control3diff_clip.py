@@ -1393,11 +1393,15 @@ def generate_images():
         camera_params_val = torch.cat([cam2world_pose_val.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose_val.shape[0],1)], 1)
         camera_params_val_list.append(camera_params_val)
 
-
+    G_step_warmup=0
     for epoch in tqdm(range(first_epoch, args.num_train_epochs),desc='epoch:',disable=not accelerator.is_main_process):
         train_loss=0.0
+        adv_step_interval=3
+        
         for step in tqdm(range(epoch_size),desc='step:',disable=not accelerator.is_main_process):
             none_condition=False
+            adv_update_D_this_step=global_step%adv_step_interval==0 
+            G_step_warmup+=1
             with torch.no_grad():
                 z_generator=torch.randn(args.train_batch_size, G.z_dim, device=device)
                 cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
@@ -1457,22 +1461,29 @@ def generate_images():
                 #     if k=='image' or k=='image_raw':
                 #         losses['loss_{}_lpips'.format(k)]=lpips_fn(v,denoised_output_recon[k]).mean()   
                 if args.adv:
-                    eg3doutput_={k:v.detach().requires_grad_(True) for k,v in eg3doutput.items()}
-
-                    logits_real_recon=D(eg3doutput_,camera_params)
                     logits_fake_recon=D(denoised_output_recon,camera_params)
-                    loss_adv_real_recon=F.softplus(-logits_real_recon).mean()
-                    loss_adv_fake_recon=F.softplus(logits_fake_recon).mean()
-                    losses['loss_adv_real_recon']=loss_adv_real_recon
-                    losses['loss_adv_fake_recon']=loss_adv_fake_recon
-                    
-                    r1_grads_recon = torch.autograd.grad(outputs=[logits_real_recon.sum()], inputs=[eg3doutput_['image'], 
+
+                    if adv_update_D_this_step:
+                        eg3doutput_={k:v.detach().requires_grad_(True) for k,v in eg3doutput.items()}
+                        logits_real_recon=D(eg3doutput_,camera_params)
+                        loss_adv_D_real_recon=F.softplus(-logits_real_recon).mean()
+                        losses['loss_adv_D_real_recon']=loss_adv_D_real_recon
+                        r1_grads_recon = torch.autograd.grad(outputs=[logits_real_recon.sum()], inputs=[eg3doutput_['image'], 
                                                                 eg3doutput_['image_raw']], create_graph=True, only_inputs=True)
-                    r1_grads_image_recon = r1_grads_recon[0]
-                    r1_grads_image_raw_recon = r1_grads_recon[1]
-                    r1_penalty_recon = r1_grads_image_recon.square().sum([1,2,3]) + r1_grads_image_raw_recon.square().sum([1,2,3])
-                    loss_r1_recon = r1_penalty_recon.mean()
-                    losses['loss_r1_recon']=loss_r1_recon
+                        r1_grads_image_recon = r1_grads_recon[0]
+                        r1_grads_image_raw_recon = r1_grads_recon[1]
+                        r1_penalty_recon = r1_grads_image_recon.square().sum([1,2,3]) + r1_grads_image_raw_recon.square().sum([1,2,3])
+                        loss_r1_recon = r1_penalty_recon.mean()
+                        losses['loss_r1_recon']=loss_r1_recon
+
+                    
+                        loss_adv_D_fake_recon=F.softplus(logits_fake_recon).mean()
+                        losses['loss_adv_D_fake_recon']=loss_adv_D_fake_recon
+
+                    loss_adv_G_fake_recon=F.softplus(-logits_fake_recon).mean()
+                    losses['loss_adv_G_fake_recon']=loss_adv_G_fake_recon*min(G_step_warmup/1000,1.)
+                    
+                    
 
             if args.multiview:
                 denoised_output_mv=G.render_from_planes(camera_params_mv,inv_normalize_fn((unet_output.sample).repeat(mv_number,1,1,1)))
@@ -1482,24 +1493,28 @@ def generate_images():
                 #         losses['loss_{}_lpips_mv'.format(k)]=lpips_fn(v,denoised_output_mv[k]).mean()
                 if args.adv:
                     # use fp32 for discriminator
-                    # with accelerator.autocast(autocast_handler=custom_autocast_handler):
-                    eg3doutput_mv_={k:v.detach().requires_grad_(True) for k,v in eg3doutput_mv.items()}
-                    # denoised_output_mv_={k:v.detach().float() for k,v in denoised_output_mv.items()}
-                    logits_real_mv=D(eg3doutput_mv_,camera_params_mv)
                     logits_fake_mv=D(denoised_output_mv,camera_params_mv)
-                    loss_adv_real_mv=F.softplus(-logits_real_mv).mean()
-                    loss_adv_fake_mv=F.softplus(logits_fake_mv).mean()
-                    losses['loss_adv_real_mv']=loss_adv_real_mv
-                    losses['loss_adv_fake_mv']=loss_adv_fake_mv
-
-                    r1_grads_mv = torch.autograd.grad(outputs=[logits_real_mv.sum()], 
+                    if adv_update_D_this_step:
+                        eg3doutput_mv_={k:v.detach().requires_grad_(True) for k,v in eg3doutput_mv.items()}
+                        logits_real_mv=D(eg3doutput_mv_,camera_params_mv)
+                        loss_adv_D_real_mv=F.softplus(-logits_real_mv).mean()
+                        losses['loss_adv_D_real_mv']=loss_adv_D_real_mv
+                        r1_grads_mv = torch.autograd.grad(outputs=[logits_real_mv.sum()], 
                                         inputs=[eg3doutput_mv_['image'], eg3doutput_mv_['image_raw']], create_graph=True, only_inputs=True)
-                    r1_grads_image_mv = r1_grads_mv[0]
-                    r1_grads_image_raw_mv = r1_grads_mv[1]
-                    r1_penalty_mv = r1_grads_image_mv.square().sum([1,2,3]) + r1_grads_image_raw_mv.square().sum([1,2,3])
-                    loss_r1_mv = r1_penalty_mv.mean()
-                    losses['loss_r1_mv']=loss_r1_mv
+                        r1_grads_image_mv = r1_grads_mv[0]
+                        r1_grads_image_raw_mv = r1_grads_mv[1]
+                        r1_penalty_mv = r1_grads_image_mv.square().sum([1,2,3]) + r1_grads_image_raw_mv.square().sum([1,2,3])
+                        loss_r1_mv = r1_penalty_mv.mean()
+                        losses['loss_r1_mv']=loss_r1_mv
 
+                    
+                        loss_adv_D_fake_mv=F.softplus(logits_fake_mv).mean()
+                        losses['loss_adv_D_fake_mv']=loss_adv_D_fake_mv
+
+                    loss_adv_G_fake_mv=F.softplus(-logits_fake_mv).mean()
+                    losses['loss_adv_G_fake_mv']=loss_adv_G_fake_mv*min(G_step_warmup/1000,1.)
+
+                    
 
 
             loss_cosine_similarity=torch.tensor(0.0,device=device)
@@ -1513,8 +1528,35 @@ def generate_images():
 
             losses['loss_cosine_similarity']=loss_cosine_similarity
 
-            loss=sum(losses.values())
+            loss=0.
+            for k,v in losses.items():
+                if not 'adv_D' in k:
+                    loss=loss+v
 
+            if args.adv :
+                D_loss=0.
+                optimizer_D.zero_grad()
+                if adv_update_D_this_step:
+                    for k,v in losses.items():
+                        if 'adv_D' in k:
+                            D_loss=D_loss+v
+                    D_loss.backward(retain_graph=True)
+                    # 测试过，通信良好的时候这样的同步不怎么会花时间
+                    params = [param for param in D.parameters() if param.numel() > 0 and param.grad is not None]
+                    if len(params) > 0:
+                        flat = torch.cat([param.grad.flatten() for param in params])
+                        if accelerator.num_processes > 1:
+                            torch.distributed.all_reduce(flat)
+                            flat /= accelerator.num_processes
+                        misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
+                        grads = flat.split([param.numel() for param in params])
+                        for param, grad in zip(params, grads):
+                            param.grad = grad.reshape(param.shape)
+                    optimizer_D.step()
+                    lr_scheduler_D.step()
+               
+
+            optimizer.zero_grad()
             avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
             train_loss += avg_loss.item() / args.gradient_accumulation_steps
             accelerator.backward(loss)
@@ -1522,23 +1564,7 @@ def generate_images():
                 accelerator.clip_grad_norm_(list(unet.parameters()), args.max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
-            optimizer.zero_grad()
             
-            if args.adv:
-                # 测试过，通信良好的时候这样的同步不怎么会花时间
-                params = [param for param in D.parameters() if param.numel() > 0 and param.grad is not None]
-                if len(params) > 0:
-                    flat = torch.cat([param.grad.flatten() for param in params])
-                    if accelerator.num_processes > 1:
-                        torch.distributed.all_reduce(flat)
-                        flat /= accelerator.num_processes
-                    misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
-                    grads = flat.split([param.numel() for param in params])
-                    for param, grad in zip(params, grads):
-                        param.grad = grad.reshape(param.shape)
-                optimizer_D.step()
-                lr_scheduler_D.step()
-                optimizer_D.zero_grad()
 
             if accelerator.sync_gradients:
                 if args.use_ema:
@@ -1547,6 +1573,8 @@ def generate_images():
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 accelerator.log({"cosine_similarity": loss_cosine_similarity}, step=global_step)
+                for k,v in losses.items():
+                    accelerator.log({k: v.detach().item()}, step=global_step)
                 train_loss = 0.0
 
                 # if global_step % args.checkpointing_steps == 0 or not sanity_checked:
@@ -1588,7 +1616,7 @@ def generate_images():
                         #     shutil.rmtree(save_path)
 
 
-            if global_step%log_step_interval==0 or not sanity_checked:
+            if global_step%log_step_interval==0:
                 if accelerator.is_main_process:
                     with torch.no_grad():
                         latent2img_fn=lambda x,camera_params_=camera_params: (G.render_from_planes(camera_params_,inv_normalize_fn(x))['image'].permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8).cpu()
@@ -1597,6 +1625,9 @@ def generate_images():
                         eg3doutput_noisy=latent2img_fn(noisy_latents)
                         eg3doutput_denoised=latent2img_fn(unet_output.sample)
                         img_concat=torch.cat([eg3doutput_, eg3doutput_noisy,eg3doutput_denoised],dim=2) # (batch_size,256,768,3)
+
+                        if args.adv:
+                            pass
 
                         if args.use_ema:
                             ema_unet.store(unet.parameters())
