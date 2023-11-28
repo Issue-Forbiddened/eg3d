@@ -596,6 +596,9 @@ def parse_args():
     # additional_sample int
     parser.add_argument("--additional_sample", type=int, default=0, help="The additional sample to generate.")
 
+    # scaled bool, default true
+    parser.add_argument("--scaled", action="store_false", help="Whether to scaled.")
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -1039,7 +1042,9 @@ def generate_images():
         G = loaded_pickle['G_ema'].to(device) # type: ignore
         if args.adv:
             D = loaded_pickle['D'].to(device) # type: ignore
-            D = DualDiscriminator_Mine(*D.init_args, **D.init_kwargs).train().requires_grad_(True).to(device)
+            D = DualDiscriminator_Mine(*D.init_args, **D.init_kwargs).train().requires_grad_(False).to(device)
+            misc.copy_params_and_buffers(loaded_pickle['D'], D, require_all=True)
+            D.requires_grad_(True)
         del loaded_pickle
 
     # Specify reload_modules=True if you want code modifications to take effect; otherwise uses pickled code
@@ -1295,8 +1300,13 @@ def generate_images():
         stats_dict=json.load(f)
     mean_load=torch.tensor(stats_dict['mean'],device=device,dtype=weight_dtype).reshape(1,96,256,256)
     std_load=torch.tensor(stats_dict['std'],device=device,dtype=weight_dtype).reshape(1,96,256,256)
-    normalize_fn=lambda x: (x-mean_load)/(std_load*7.5)
-    inv_normalize_fn=lambda x: x*std_load*7.5+mean_load
+    if args.scaled:
+        logger.info('using scaled')
+        normalize_fn=lambda x: (x-mean_load)/(std_load*7.5)
+        inv_normalize_fn=lambda x: x*std_load*7.5+mean_load
+    else:
+        normalize_fn=lambda x: (x-mean_load)/(std_load)
+        inv_normalize_fn=lambda x: x*std_load+mean_load
     
     if mean_load.isnan().any():
         raise ValueError('mean has nan value')
@@ -1394,10 +1404,11 @@ def generate_images():
         camera_params_val_list.append(camera_params_val)
 
     G_step_warmup=0
+    G_step_warmup_total=2500
     for epoch in tqdm(range(first_epoch, args.num_train_epochs),desc='epoch:',disable=not accelerator.is_main_process):
         train_loss=0.0
-        adv_step_interval=3
-        
+        adv_step_interval=1
+        miscs_list={}
         for step in tqdm(range(epoch_size),desc='step:',disable=not accelerator.is_main_process):
             none_condition=False
             adv_update_D_this_step=global_step%adv_step_interval==0 
@@ -1454,20 +1465,30 @@ def generate_images():
 
             losses['loss_diff']=loss_diff
 
+            miscs={}
             if args.recon:
                 denoised_output_recon=G.render_from_planes(camera_params,inv_normalize_fn(unet_output.sample))
-                # for k,v in eg3doutput.items():
-                #     losses['loss_{}'.format(k)]=F.mse_loss(v,denoised_output_recon[k])
-                #     if k=='image' or k=='image_raw':
-                #         losses['loss_{}_lpips'.format(k)]=lpips_fn(v,denoised_output_recon[k]).mean()   
+                for k,v in eg3doutput.items():
+                    losses['loss_{}_recon'.format(k)]=F.mse_loss(v,denoised_output_recon[k])
+                    if k=='image' or k=='image_raw':
+                        losses['loss_{}_lpips_recon'.format(k)]=lpips_fn(v,denoised_output_recon[k]).mean()
                 if args.adv:
+                    for k,v in losses.items():
+                        if 'recon' in k:
+                            losses[k]=v*max(1-G_step_warmup/G_step_warmup_total,0.01)
+
                     logits_fake_recon=D(denoised_output_recon,camera_params)
 
                     if adv_update_D_this_step:
                         eg3doutput_={k:v.detach().requires_grad_(True) for k,v in eg3doutput.items()}
                         logits_real_recon=D(eg3doutput_,camera_params)
+                        miscs['D_real_accuracy_recon']=logits_real_recon.sign().mean().item()
+
                         loss_adv_D_real_recon=F.softplus(-logits_real_recon).mean()
                         losses['loss_adv_D_real_recon']=loss_adv_D_real_recon
+
+                        miscs['D_fake_accuracy_recon']=-logits_fake_recon.sign().mean().item()
+
                         r1_grads_recon = torch.autograd.grad(outputs=[logits_real_recon.sum()], inputs=[eg3doutput_['image'], 
                                                                 eg3doutput_['image_raw']], create_graph=True, only_inputs=True)
                         r1_grads_image_recon = r1_grads_recon[0]
@@ -1481,22 +1502,26 @@ def generate_images():
                         losses['loss_adv_D_fake_recon']=loss_adv_D_fake_recon
 
                     loss_adv_G_fake_recon=F.softplus(-logits_fake_recon).mean()
-                    losses['loss_adv_G_fake_recon']=loss_adv_G_fake_recon*min(G_step_warmup/1000,1.)
+                    losses['loss_adv_G_fake_recon']=loss_adv_G_fake_recon*min(G_step_warmup/G_step_warmup_total,1.)*0.001
                     
                     
 
             if args.multiview:
                 denoised_output_mv=G.render_from_planes(camera_params_mv,inv_normalize_fn((unet_output.sample).repeat(mv_number,1,1,1)))
-                # for k,v in eg3doutput_mv.items():
-                #     losses['loss_{}_mv'.format(k)]=F.mse_loss(v,denoised_output_mv[k])
-                #     if k=='image' or k=='image_raw':
-                #         losses['loss_{}_lpips_mv'.format(k)]=lpips_fn(v,denoised_output_mv[k]).mean()
+                for k,v in eg3doutput_mv.items():
+                    losses['loss_{}_mv'.format(k)]=F.mse_loss(v,denoised_output_mv[k])
+                    if k=='image' or k=='image_raw':
+                        losses['loss_{}_lpips_mv'.format(k)]=lpips_fn(v,denoised_output_mv[k]).mean()
                 if args.adv:
+                    for k,v in losses.items():
+                        if 'mv' in k:
+                            losses[k]=v*max(1-G_step_warmup/G_step_warmup_total,0.01)
                     # use fp32 for discriminator
                     logits_fake_mv=D(denoised_output_mv,camera_params_mv)
                     if adv_update_D_this_step:
                         eg3doutput_mv_={k:v.detach().requires_grad_(True) for k,v in eg3doutput_mv.items()}
                         logits_real_mv=D(eg3doutput_mv_,camera_params_mv)
+                        miscs['D_real_accuracy_mv']=logits_real_mv.sign().mean().item()
                         loss_adv_D_real_mv=F.softplus(-logits_real_mv).mean()
                         losses['loss_adv_D_real_mv']=loss_adv_D_real_mv
                         r1_grads_mv = torch.autograd.grad(outputs=[logits_real_mv.sum()], 
@@ -1507,12 +1532,13 @@ def generate_images():
                         loss_r1_mv = r1_penalty_mv.mean()
                         losses['loss_r1_mv']=loss_r1_mv
 
+                        miscs['D_fake_accuracy_mv']=-logits_fake_mv.sign().mean().item()
                     
                         loss_adv_D_fake_mv=F.softplus(logits_fake_mv).mean()
                         losses['loss_adv_D_fake_mv']=loss_adv_D_fake_mv
 
                     loss_adv_G_fake_mv=F.softplus(-logits_fake_mv).mean()
-                    losses['loss_adv_G_fake_mv']=loss_adv_G_fake_mv*min(G_step_warmup/1000,1.)
+                    losses['loss_adv_G_fake_mv']=loss_adv_G_fake_mv*min(G_step_warmup/G_step_warmup_total,1.)*0.001
 
                     
 
@@ -1565,6 +1591,10 @@ def generate_images():
             optimizer.step()
             lr_scheduler.step()
             
+            for k,v in miscs.items():
+                if not k in miscs_list:
+                    miscs_list[k]=[]
+                miscs_list[k].append(v)
 
             if accelerator.sync_gradients:
                 if args.use_ema:
@@ -1576,6 +1606,7 @@ def generate_images():
                 for k,v in losses.items():
                     accelerator.log({k: v.detach().item()}, step=global_step)
                 train_loss = 0.0
+
 
                 # if global_step % args.checkpointing_steps == 0 or not sanity_checked:
                 if global_step % args.checkpointing_steps == 0:
@@ -1604,6 +1635,9 @@ def generate_images():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
                         shutil.copy(os.path.join(args.output_dir,"train_control3diff_tmp_{}.py".format(str(file_idx))), save_path)
+                        # 保存当前的args到checkpoint
+                        with open(os.path.join(save_path,'args.json'),'w') as f:
+                            json.dump(vars(args),f)
 
                         if args.adv:
                             # save D
@@ -1616,7 +1650,7 @@ def generate_images():
                         #     shutil.rmtree(save_path)
 
 
-            if global_step%log_step_interval==0:
+            if global_step%log_step_interval==0 or not sanity_checked:
                 if accelerator.is_main_process:
                     with torch.no_grad():
                         latent2img_fn=lambda x,camera_params_=camera_params: (G.render_from_planes(camera_params_,inv_normalize_fn(x))['image'].permute(0, 2, 3, 1)*127.5+128).clamp(0,255).to(torch.uint8).cpu()
@@ -1666,13 +1700,13 @@ def generate_images():
                             eg3doutput_denoised_ema_multistep=reverse_process_list[-1]
                             img_concat=torch.cat([img_concat, eg3doutput_denoised_ema_multistep],dim=2)
                             reverse_process_list=torch.cat(reverse_process_list,dim=2).flatten(0,1)
-                            # accelerator.log({'reverse_process':wandb.Image(reverse_process_list.numpy())},step=global_step)
+                            accelerator.log({'reverse_process':wandb.Image(reverse_process_list.numpy())},step=global_step)
                             del reverse_process_list
 
                             reverse_guidance_process_list,denoised_ddim_cfg=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
                                                                           G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='cfg',return_pred=True,return_latents=True)
                             reverse_guidance_process_list=torch.cat(reverse_guidance_process_list,dim=2).flatten(0,1)
-                            # accelerator.log({'reverse_guidance_process_cfg':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
+                            accelerator.log({'reverse_guidance_process_cfg':wandb.Image(reverse_guidance_process_list.numpy())},step=global_step)
 
                             # reverse_guidance_process_list,denoised_ddim_guided_ori=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
                             #                                               G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='vgg_guidance_0',return_pred=True,return_latents=True)
@@ -1720,7 +1754,7 @@ def generate_images():
                                                                                         sqrt_additional_sample*multiview_image_list.shape[4],3) # (frames,sqrt_additional_sample*256,sqrt_additional_sample*256,3)
                                     
                                     original_prompt_with_line=args.verify_text.replace(' ','_')
-                                    accelerator.log({f'reverse_process_normal_text_additional_sample_prompt_{original_prompt_with_line}':wandb.Image(reverse_guidance_process_list_text[0].numpy())},step=global_step)
+                                    accelerator.log({f'reverse_process_normal_text_additional_sample_prompt_{original_prompt_with_line}':wandb.Image(multiview_image_list[0])},step=global_step)
 
                                     frame_height, frame_width = multiview_image_list.shape[1], multiview_image_list.shape[2]
                                     video_fps = 25.0
@@ -1869,15 +1903,15 @@ def generate_images():
                             np.savetxt(os.path.join(args.output_dir,f'cosine_similarity_val_{global_step}.txt'),cosine_similarity_val)
 
                             # 可视化注意力图
-                            encoder_states_img=[encoder_state.reshape(-1,int(np.sqrt(encoder_state.shape[1])),int(np.sqrt(encoder_state.shape[1])),encoder_state.shape[-1]).permute(0,3,1,2) for encoder_state in encoder_states]
-                            # interpolate to 64*64
-                            encoder_states_img=[F.interpolate(encoder_state,(64,64)).mean(1,keepdim=True) for encoder_state in encoder_states_img]
-                            # normalize to 0-1
-                            encoder_states_img=[(encoder_state-encoder_state.min())/(encoder_state.max()-encoder_state.min()) for encoder_state in encoder_states_img]
-                            # encoder_states_img_self_attention=[(encoder_state-encoder_state.min())/(encoder_state.max()-encoder_state.min()) for encoder_state in encoder_states_img_self_attention]
-                            # concat
-                            encoder_states_img=torch.cat(encoder_states_img,dim=-1).permute(0,2,3,1).flatten(0,1).detach().cpu()
-                            accelerator.log({'encoder_states_img':wandb.Image(encoder_states_img.numpy())},step=global_step)
+                            # encoder_states_img=[encoder_state.reshape(-1,int(np.sqrt(encoder_state.shape[1])),int(np.sqrt(encoder_state.shape[1])),encoder_state.shape[-1]).permute(0,3,1,2) for encoder_state in encoder_states]
+                            # # interpolate to 64*64
+                            # encoder_states_img=[F.interpolate(encoder_state,(64,64)).mean(1,keepdim=True) for encoder_state in encoder_states_img]
+                            # # normalize to 0-1
+                            # encoder_states_img=[(encoder_state-encoder_state.min())/(encoder_state.max()-encoder_state.min()) for encoder_state in encoder_states_img]
+                            # # encoder_states_img_self_attention=[(encoder_state-encoder_state.min())/(encoder_state.max()-encoder_state.min()) for encoder_state in encoder_states_img_self_attention]
+                            # # concat
+                            # encoder_states_img=torch.cat(encoder_states_img,dim=-1).permute(0,2,3,1).flatten(0,1).detach().cpu()
+                            # accelerator.log({'encoder_states_img':wandb.Image(encoder_states_img.numpy())},step=global_step)
 
                             if args.test_video:
                                 multiview_image_list=[]
@@ -1924,10 +1958,14 @@ def generate_images():
                         # save to wandb
                         accelerator.log({'origin_noised_denoised_denoisedema_(denoised_none_condition)_denoisedemamultistep':wandb.Image(img_concat.cpu().numpy())},step=global_step)
                         del img_concat, eg3doutput_,eg3doutput_noisy,eg3doutput_denoised
-                        # return
+
+
+
             sanity_checked=True
             accelerator.wait_for_everyone()
-
+        for k,v in miscs_list.items():
+            v_mean=sum(v)/len(v)
+            accelerator.log({k: v_mean}, step=global_step)
 
 
 
@@ -1941,4 +1979,6 @@ if __name__ == "__main__":
     generate_images() # pylint: disable=no-value-for-parameter
 
 #----------------------------------------------------------------------------
-# accelerate launch --mixed_precision=fp16 train_control3diff_clip.py --train_batch_size=4 --log_step_interval=5000 --checkpointing_steps=7500 --use_ema --resume_from_checkpoint=latest --output=control3diff_trained_clip_large_noise_mv
+# accelerate launch --mixed_precision=fp16 train_control3diff_clip.py --train_batch_size=3 --log_step_interval=5000 --checkpointing_steps=7500 --use_ema --resume_from_checkpoint=latest --output=control3diff_trained_clip_large_noise_mv
+
+# --verify_text='A middle-aged Caucasian woman with sharp blue eyes, a prominent nose, thin lips, and wearing round-framed glasses' --additional_sample=16

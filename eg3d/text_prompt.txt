@@ -1,0 +1,12 @@
+A young Asian woman with almond-shaped brown eyes, a delicate nose, and full lips
+A middle-aged Caucasian woman with sharp blue eyes, a prominent nose, thin lips, and wearing round-framed glasses
+Image of a young Hispanic female with large brown eyes, long straight hair, and a gentle smile, her face illuminated with soft light
+Portrait of a middle-aged African woman with dark brown eyes, short curly hair, and a warm, inviting smile
+Close-up of a young male with bright green eyes, short blond hair, and a clean-shaven face, showing a neutral expression
+
+A long hair Asian handsome young man, with a gentle smile
+
+
+
+CUDA_VISIBLE_DEVICES=0 python test_control3diff_clip.py --train_batch_size=1 --log_step_interval=5000 --checkpointing_steps=7500 --use_ema --resume_from_checkpoint=latest --output_dir=control3diff_trained_clip   --verify_text='Close-up of a young male with bright green eyes, short blond hair, and a clean-shaven face, showing a neutral expression' --additional_sample=16 --scaled
+CUDA_VISIBLE_DEVICES=1 python test_control3diff_clip.py --train_batch_size=1 --log_step_interval=5000 --checkpointing_steps=7500 --use_ema --resume_from_checkpoint=latest --output_dir=control3diff_trained_clip   --verify_text='A young Asian woman with almond-shaped brown eyes, a delicate nose, and full lips' --additional_sample=16 --scaled
