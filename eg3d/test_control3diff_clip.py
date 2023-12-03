@@ -59,6 +59,7 @@ from accelerate.utils import AutocastKwargs
 import cv2
 import pdb
 import time
+from moviepy.editor import VideoFileClip
 # import matplotlib.pyplot as plt
 #----------------------------------------------------------------------------
 
@@ -1773,6 +1774,15 @@ def generate_images():
 
                                     # Release the VideoWriter object
                                     out.release()
+
+                                    # File paths
+                                    avi_file_path = os.path.join(args.output_dir,
+                                                                       'output_video_{}_additional_sample_prompt_{}.avi'.format(str(global_step),original_prompt_with_line))
+                                    mp4_file_path = avi_file_path.replace('.avi', '.mp4')
+
+                                    # Convert AVI to MP4
+                                    clip = VideoFileClip(avi_file_path)
+                                    clip.write_videofile(mp4_file_path, codec='libx264')
 
                                 # encoder_states_text=prompt_embeds.unsqueeze(0).unsqueeze(0).repeat(num_cross_attention_block,noise.shape[0],1,1)
                                 # reverse_guidance_process_list_text,denoised_ddim_cfg_text=\

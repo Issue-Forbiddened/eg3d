@@ -1,4 +1,4 @@
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection,CLIPTokenizer,CLIPTextModel,CLIPModel,AutoProcessor
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection,CLIPTokenizer,CLIPTextModel,CLIPModel,AutoProcessor,CLIPFeatureExtractor
 from diffusers import StableDiffusionImageVariationPipeline
 from PIL import Image
 from torchvision import transforms

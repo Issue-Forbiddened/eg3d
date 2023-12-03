@@ -914,7 +914,7 @@ def inversion_G_data(sample_num, device, truncation_psi, truncation_cutoff,
 
 
         reverse_process_list,denoised_ddim=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
-                                            G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type=reverse_type,return_pred=True,return_latents=True,i_end=10)
+                                            G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type=reverse_type,return_pred=True,return_latents=True,i_end=50)
 
 
         # 收集结果
@@ -948,6 +948,82 @@ def multiview_render(latents,camera_params_val_list,latent2img_fn):
         multiview_image_list.append(torch.cat(multiview_image_list_per_frame,dim=0)) # (additional_sample,256,256,3)
     multiview_image_list=torch.stack(multiview_image_list,dim=0) # (frames,additional_sample,256,256,3)
     return multiview_image_list
+@torch.no_grad()
+def inversion_G_data_with_render(sample_num, device, truncation_psi, truncation_cutoff, 
+                                args, normalize_fn, encoder, unet_val, latent_guidance, 
+                                lpips_fn, inv_normalize_fn, reverse_type, noise_scheduler,
+                                G, latent2img_fn, intrinsics, batch_size=8,
+                                stride_for_quantitative=None,
+                                camera_params_val_list=None,latent2img_fn_nouint8=None):
+    # 初始化结果存储
+    all_psnr=0.
+    all_lpips=0.
+
+    print('inversion_G_data')
+    for i in tqdm(range(0, sample_num, batch_size), desc='inversion_G_data'):
+        current_batch_size = min(batch_size, sample_num - i)
+
+        # 为当前批次采样 z
+        z_generator = torch.randn(current_batch_size, G.z_dim, device=device)
+
+        # sample camera
+        cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
+        cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
+        cam2world_pose=UniformCameraPoseSampler.sample(np.pi/2, np.pi/2 , horizontal_stddev=np.pi/4,vertical_stddev=np.pi/4,
+        lookat_position=torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device), 
+        radius=G.rendering_kwargs.get('avg_camera_radius', 2.7), device=device,batch_size=current_batch_size)
+        conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device,batch_size=current_batch_size)
+        camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
+        conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
+
+        # generate triplane
+        ws = G.mapping(z_generator, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
+        planes=G.get_planes(ws) # (batch_size,96,256,256)
+        eg3doutput=G.render_from_planes(camera_params,planes)
+        # latents=normalize_fn(planes)
+        noise=torch.randn_like(planes)
+
+        # encode triplane
+        encoder_states=encoder(eg3doutput['image'].detach())
+        noise_scheduler.set_timesteps(args.num_inference_steps, device=device)
+        timesteps = noise_scheduler.timesteps
+
+
+        reverse_process_list,denoised_ddim=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
+                                            G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type=reverse_type,return_pred=True,return_latents=True,i_end=50)
+        
+        if stride_for_quantitative is not None:
+            original_multiview=multiview_render(normalize_fn(planes),camera_params_val_list[::stride_for_quantitative],latent2img_fn_nouint8) 
+            predicted_multiview=multiview_render(denoised_ddim,camera_params_val_list[::stride_for_quantitative],latent2img_fn_nouint8)
+        else:
+            original_multiview=multiview_render(normalize_fn(planes),camera_params_val_list,latent2img_fn_nouint8) 
+            predicted_multiview=multiview_render(denoised_ddim,camera_params_val_list,latent2img_fn_nouint8)
+
+        mse=torch.mean((original_multiview-predicted_multiview)**2,dim=[1,2,3])
+        psnr=10*torch.log10(4/mse)
+        psnr_metric=torch.mean(psnr).item()
+
+        # compute lpips, note that images are in [-1,1], average over batch
+        original_multiview_flatten=original_multiview.flatten(0,1).permute(0,3,1,2) # (frames*additional_sample,3,256,256)
+        predicted_multiview_flatten=predicted_multiview.flatten(0,1).permute(0,3,1,2)
+        lpips_metric=lpips_fn(original_multiview_flatten.to(device),predicted_multiview_flatten.to(device)).mean().item()
+
+        all_psnr+=psnr_metric*current_batch_size
+        all_lpips+=lpips_metric*current_batch_size
+
+    all_psnr=all_psnr/sample_num
+    all_lpips=all_lpips/sample_num
+    ret_dict = {
+        'psnr': all_psnr,
+        'lpips': all_lpips,
+    }
+
+
+
+
+
+    return ret_dict
+
 
 
     
@@ -1402,6 +1478,7 @@ def generate_images():
     camera_params_val_list=[]
     sample_num_per_frame=512
     sample_for_visualize_per_frame=4
+    stride_for_quantitative=frames//frames_for_quantitative
     for frame_idx in range(frames):
         cam2world_pose_val = LookAtPoseSampler.sample(3.14/2 + yaw_range * np.sin(2 * 3.14 * frame_idx / (frames)),
                                             3.14/2 -0.05 + pitch_range * np.cos(2 * 3.14 * frame_idx / (frames)),
@@ -1428,15 +1505,22 @@ def generate_images():
     encoder_val=accelerator.unwrap_model(encoder)
 
     
-    inverse_G_data_ret_dict=inversion_G_data(sample_num=sample_num_per_frame, device=device, 
+    # inverse_G_data_metric_ret_dict=inversion_G_data_with_render(sample_num=sample_num_per_frame, device=device, 
+    #                             truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff,
+    #                             args=args, normalize_fn=normalize_fn, encoder=encoder_val, unet_val=unet_val, latent_guidance=latent_guidance,
+    #                             lpips_fn=lpips_fn, inv_normalize_fn=inv_normalize_fn, reverse_type='normal',
+    #                             noise_scheduler=noise_scheduler, G=G, latent2img_fn=None, intrinsics=intrinsics,
+    #                             camera_params_val_list=camera_params_val_list,stride_for_quantitative=stride_for_quantitative,latent2img_fn_nouint8=latent2img_fn_nouint8)
+    # seed with seed 5
+    inverse_G_data_ret_dict=inversion_G_data(sample_num=sample_for_visualize_per_frame, device=device, 
                                 truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff,
                                 args=args, normalize_fn=normalize_fn, encoder=encoder_val, unet_val=unet_val, latent_guidance=latent_guidance,
                                 lpips_fn=lpips_fn, inv_normalize_fn=inv_normalize_fn, reverse_type='normal',
                                 noise_scheduler=noise_scheduler, G=G, latent2img_fn=None, intrinsics=intrinsics)
-    
-    original_multiview_visualize=multiview_render(inverse_G_data_ret_dict['original_latents'][:sample_for_visualize_per_frame],\
+
+    original_multiview_visualize=multiview_render(inverse_G_data_ret_dict['original_latents'],\
                                                   camera_params_val_list,latent2img_fn_nouint8)  # (frames,sample_for_visualize_per_frame,256,256,3)
-    predicted_multiview_visualize=multiview_render(inverse_G_data_ret_dict['predicted_latents'][:sample_for_visualize_per_frame],
+    predicted_multiview_visualize=multiview_render(inverse_G_data_ret_dict['predicted_latents'],
                                                    camera_params_val_list,latent2img_fn_nouint8)
 
     concate_multiview_visualize=torch.cat([original_multiview_visualize,predicted_multiview_visualize],dim=3).flatten(1,2) # (frames,sample_for_visualize_per_frame*256,2*256,3)
@@ -1466,65 +1550,13 @@ def generate_images():
     # Release the VideoWriter object
     out.release()
 
-
-    stride_for_quantitative=frames//frames_for_quantitative
-
-    # original_multiview=multiview_render(inverse_G_data_ret_dict['original_latents'],camera_params_val_list,latent2img_fn_nouint8) # (frames,additional_sample,256,256,3)
-    # predicted_multiview=multiview_render(inverse_G_data_ret_dict['predicted_latents'],camera_params_val_list,latent2img_fn_nouint8)
-    
-    original_multiview=multiview_render(inverse_G_data_ret_dict['original_latents'][::stride_for_quantitative],camera_params_val_list,latent2img_fn_nouint8) 
-    predicted_multiview=multiview_render(inverse_G_data_ret_dict['predicted_latents'][::stride_for_quantitative],camera_params_val_list,latent2img_fn_nouint8)
-
-
-    with torch.no_grad():
-        # compute psnr, note that images are in [-1,1], average over batch
-        mse=torch.mean((original_multiview-predicted_multiview)**2,dim=[1,2,3])
-        psnr=10*torch.log10(4/mse)
-        psnr_metric=torch.mean(psnr)
-
-        # compute lpips, note that images are in [-1,1], average over batch
-        original_multiview_flatten=original_multiview.flatten(0,1).permute(0,3,1,2) # (frames*additional_sample,3,256,256)
-        predicted_multiview_flatten=predicted_multiview.flatten(0,1).permute(0,3,1,2)
-        # for i in range(original_multiview_flatten.shape[0]):
-        #     lpips_metric=lpips_fn(original_multiview_flatten[i].to(device),predicted_multiview_flatten[i].to(device)).mean()
-        #     if i==0:
-        #         lpips_metric_sum=lpips_metric
-        #     else:
-        #         lpips_metric_sum+=lpips_metric
-        # lpips_metric=lpips_metric_sum/original_multiview_flatten.shape[0]
-
-        # 设置每次处理的图像数量
-        batch_size_lpips = 8  # 或者你需要的任何其他数量
-
-        # 初始化总的LPIPS指标
-        lpips_metric_sum = 0.0
-        total_images = 0
-
-        # 通过所有图像进行迭代
-        for i in range(0, len(original_multiview_flatten), batch_size_lpips):
-            # 获取当前批次的图像，确保不会超出数组边界
-            original_batch = original_multiview_flatten[i:i+batch_size_lpips].to(device)
-            predicted_batch = predicted_multiview_flatten[i:i+batch_size_lpips].to(device)
-
-            # 计算当前批次的 LPIPS 并累加
-            lpips_batch_metric = lpips_fn(original_batch, predicted_batch).mean().item()
-            lpips_metric_sum += lpips_batch_metric * original_batch.size(0)
-            total_images += original_batch.size(0)
-
-        # 计算平均LPIPS指标
-        lpips_metric = lpips_metric_sum / total_images
-
-
-
-
-
-    if accelerator.is_main_process: 
-        # write to args.output_dir with name 'metrics.json'
-        metrics_dict = {'psnr': psnr_metric.item(), 'lpips': lpips_metric.item()}
-        metrics_dict['description'] = f'test with {sample_num_per_frame} samples per frame, {frames_for_quantitative} frames'
-        with open(os.path.join(args.output_dir,f'metrics_{global_step}.json'),'w') as f:
-            json.dump(metrics_dict,f)
-        pass
+    # if accelerator.is_main_process: 
+    #     # write to args.output_dir with name 'metrics.json'
+    #     metrics_dict = inverse_G_data_metric_ret_dict
+    #     metrics_dict['description'] = f'test with {sample_num_per_frame} samples per frame, {frames_for_quantitative} frames'
+    #     with open(os.path.join(args.output_dir,f'metrics_{global_step}.json'),'w') as f:
+    #         json.dump(metrics_dict,f)
+    #     pass
 
 
 
@@ -1546,3 +1578,7 @@ if __name__ == "__main__":
 
 # CUDA_VISIBLE_DEVICES=0 python test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=latest  --output_dir=control3diff_trained_unconditional --wandb_offline --scaled
 # CUDA_VISIBLE_DEVICES=1 python test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=/home1/jo_891/data1/eg3d/eg3d/control3diff_trained_unconditional/checkpoint-400000  --output_dir=control3diff_trained_unconditional --wandb_offline --scaled
+
+
+
+# CUDA_VISIBLE_DEVICES=0 python test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=latest  --output_dir=control3diff_trained_large_noise --wandb_offline
