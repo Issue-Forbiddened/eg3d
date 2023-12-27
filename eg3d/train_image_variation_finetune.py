@@ -1461,6 +1461,11 @@ def generate_images():
 
     G_step_warmup=0
     G_step_warmup_total=2500
+
+    if args.prediction_type is not None:
+        # set prediction_type of scheduler if defined
+        noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+
     for epoch in tqdm(range(first_epoch, args.num_train_epochs),desc='epoch:',disable=not accelerator.is_main_process):
         train_loss=0.0
         adv_step_interval=1
@@ -1523,7 +1528,6 @@ def generate_images():
             elif noise_scheduler.config.prediction_type == "sample":
                 target = latents
 
-            
             snr = compute_snr(noise_scheduler, timesteps)
             mse_loss_weights=torch.sigmoid(torch.log(snr))
             losses={}
