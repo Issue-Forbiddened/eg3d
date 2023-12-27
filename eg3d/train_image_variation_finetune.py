@@ -571,7 +571,7 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        '--network_pkl', help='Network pickle filename', required=False,default='/home1/jo_891/data1/eg3d/ffhqrebalanced512-128.pkl'
+        '--network_pkl', help='Network pickle filename', required=False,default='/home/junyi/eg3d/eg3d/pretrained_models/ffhqrebalanced512-128.pkl'
     )
     parser.add_argument(
         '--truncation_psi', type=float, help='Truncation psi', default=0.7
@@ -893,6 +893,7 @@ def expand_unet(unet,unet_id):
 
     # 将新的权重赋值给新的卷积层
     new_conv_in.weight.data = new_weights
+    # new_conv_in.bias.data=original_conv_in.bias.data
 
     unet.conv_in=new_conv_in
 
@@ -906,6 +907,7 @@ def expand_unet(unet,unet_id):
     original_weights_conv_out = original_conv_out.weight.data
     new_weights = original_weights_conv_out.repeat(24, 1, 1, 1)  # 重复权重以匹配新的输出通道数
     new_conv_out.weight.data = new_weights
+    # new_conv_out.bias.data=original_conv_out.bias.data
 
     unet.conv_out=new_conv_out
 
@@ -1051,11 +1053,6 @@ def generate_images():
 
     # Add adapter and make sure the trainable params are in float32.
     unet.add_adapter(unet_lora_config)
-    if args.mixed_precision == "fp16":
-        for param in unet.parameters():
-            # only upcast trainable parameters (LoRA) into fp32
-            if param.requires_grad:
-                param.data = param.to(torch.float32)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -1070,8 +1067,19 @@ def generate_images():
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
-    lora_layers = filter(lambda p: p.requires_grad, unet.parameters())
+    lora_layers = list(filter(lambda p: p.requires_grad, unet.parameters()))
 
+    for param in unet.conv_in.parameters():
+        param.requires_grad_(True)
+
+    for param in unet.conv_out.parameters():
+        param.requires_grad_(True)
+
+    if args.mixed_precision == "fp16":
+        for param in unet.parameters():
+            # only upcast trainable parameters (LoRA) into fp32
+            if param.requires_grad:
+                param.data = param.to(torch.float32)
 
     if args.use_ema:
         ema_unet = EMAModel(unet.parameters(), model_cls=UNet2DConditionModel, model_config=unet.config)
@@ -1138,7 +1146,7 @@ def generate_images():
     params=[]
     conv_params={'params':list(unet.conv_in.parameters())+list(unet.conv_out.parameters()),'lr':10*args.learning_rate}
     params.append(conv_params)
-    params.append({'params':list(lora_layers),'lr':args.learning_rate})
+    params.append({'params':(lora_layers),'lr':args.learning_rate})
 
    # Initialize the optimizer
     if args.use_8bit_adam:
@@ -2070,4 +2078,4 @@ if __name__ == "__main__":
 
 # accelerate launch --mixed_precision=fp16 train_control3diff_clip.py --train_batch_size=4 --log_step_interval=5000 --checkpointing_steps=7500 --use_ema --resume_from_checkpoint=latest --output=control3diff_trained_clip_retrain --scaled --verify_text='Close-up of a young male with bright green eyes, short blond hair, and a clean-shaven face, showing a neutral expression' --additional_sample=16
 
-# accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=16 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=latest --output=image_variation_finetune --wandb_offline
+# accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=16 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=image_variation_finetune --wandb_offline
