@@ -1256,7 +1256,7 @@ def generate_images():
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(os.path.join(args.output_dir, path))
-            load_expanded_unet(unet, os.path.join(args.output_dir, path), device=device)
+            load_expanded_unet(accelerator.unwrap_model(unet), os.path.join(args.output_dir, path), device=device)
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step
