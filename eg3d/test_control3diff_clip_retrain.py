@@ -52,7 +52,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 import lpips
 from torchvision import transforms
-from transformers import  CLIPVisionModelWithProjection,CLIPTextModel,CLIPTokenizer,CLIPModel
+from transformers import  CLIPVisionModelWithProjection,CLIPTextModel,CLIPTokenizer,CLIPModel,AutoProcessor
 from training.dual_discriminator import DualDiscriminator_Mine
 
 from accelerate.utils import AutocastKwargs
@@ -715,7 +715,7 @@ def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder
             latents=noise_scheduler.step(pred, t, latents, return_dict=False)[0]
 
         elif reverse_type=='cfg':
-            if i<i_end-5:
+            if i<i_end-5 or True:
                 pred_cfg=unet(latents,t,encoder_states,return_dict=False)[0]
                 pred_non_con=unet(latents,t,encoder_states_none,return_dict=False)[0]
                 pred_cfg=pred_cfg+2.0*(pred_cfg-pred_non_con)
@@ -950,25 +950,17 @@ def generate_images():
     #                             }
 
     # encoder=Encoder(**encoder_config)
-    encoder=CLIPVisionModelWithProjection.from_pretrained("lambdalabs/sd-image-variations-diffusers",
-                    subfolder='image_encoder').to(device) #这个就是"openai/clip-vit-large-patch14"的image_encoder
-    encoder.requires_grad_(False)
-    clip_normalize_fn=transforms.Compose([
-        transforms.Resize(
-            (224, 224),
-            interpolation=transforms.InterpolationMode.BICUBIC,
-            antialias=False,
-            ),
-        transforms.Normalize(
-        [0.48145466, 0.4578275, 0.40821073],
-        [0.26862954, 0.26130258, 0.27577711]),
-    ])
+    clip=CLIPModel.from_pretrained('openai/clip-vit-large-patch14').to(device)
+    clip.requires_grad_(False)
+    encoder=lambda x:clip.get_image_features(x)
+                    
+    processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    clip_normalize_fn= lambda x:processor(images=(x*127.5+128).clamp(0,255).to(torch.uint8),return_tensors='pt').pixel_values.to(device) #假设输入是-1~1
 
     if args.verify_text:
         # text_encoder=CLIPTextModel.from_pretrained('CompVis/stable-diffusion-v1-4',subfolder='text_encoder').to(device)
         # text_encoder.requires_grad_(False)
-        clip=CLIPModel.from_pretrained('openai/clip-vit-large-patch14').to(device)
-        tokenizer=CLIPTokenizer.from_pretrained('CompVis/stable-diffusion-v1-4',subfolder='tokenizer')
+        tokenizer=CLIPTokenizer.from_pretrained('openai/clip-vit-large-patch14')
         with torch.no_grad():
             text_inputs = tokenizer(
                 args.verify_text,
@@ -1106,7 +1098,7 @@ def generate_images():
         
         # snr_dummy=alphas_cumprod
 
-    noise_scheduler_dummy=diffusers.schedulers.DDPMScheduler(**noise_scheduler_config_dummpy)
+    noise_scheduler_dummy=diffusers.schedulers.DDIMScheduler(**noise_scheduler_config_dummpy)
     snr=1/((noise_scheduler_dummy.alphas_cumprod)**(-1)-1)
     logsnr=torch.log(snr)
     logsnr_shifted=logsnr+2*np.log(64/256)
@@ -1115,7 +1107,7 @@ def generate_images():
     betas=torch.stack([1-alphas_cumprod_shifted[i+1]/alphas_cumprod_shifted[i] for i in range(len(alphas_cumprod_shifted)-1)]+[noise_scheduler_dummy.betas[-1]])
     betas=betas.cpu().numpy().tolist()
     noise_scheduler_config_dummpy['trained_betas']=betas
-    noise_scheduler=diffusers.schedulers.DDPMScheduler(**noise_scheduler_config_dummpy)
+    noise_scheduler=diffusers.schedulers.DDIMScheduler(**noise_scheduler_config_dummpy)
 
 
     params = list(unet.parameters())                
@@ -1456,7 +1448,7 @@ def generate_images():
                 encoder_states=[torch.zeros(encoder_output_shape[i],device=device,dtype=noisy_latents.dtype) for i in range(len(encoder_output_shape))]
                 none_condition=True
             else:
-                encoder_states=encoder(clip_normalize_fn(eg3doutput['image'].detach())).image_embeds.unsqueeze(1) # image_embeds: (batch_size, 768)
+                encoder_states=encoder(clip_normalize_fn(eg3doutput['image'].detach())).unsqueeze(1) # image_embeds: (batch_size, 768)
                 encoder_states=encoder_states/encoder_states.norm(dim=-1,keepdim=True)
                 encoder_states=encoder_states.unsqueeze(0).repeat(num_cross_attention_block,1,1,1)
                 if encoder_output_shape is None:
@@ -1677,7 +1669,7 @@ def generate_images():
                             # encoder_val=accelerator.unwrap_model(encoder)
                             encoder_val=encoder
 
-                            encoder_states=encoder_val(clip_normalize_fn(eg3doutput['image'].detach())).image_embeds.unsqueeze(1).unsqueeze(0).repeat(num_cross_attention_block,1,1,1)
+                            encoder_states=encoder_val(clip_normalize_fn(eg3doutput['image'].detach())).unsqueeze(1).unsqueeze(0).repeat(num_cross_attention_block,1,1,1)
                             encoder_states=encoder_states/encoder_states.norm(dim=-1,keepdim=True)
                             unet_output=unet_val(noisy_latents,timesteps,encoder_states)     
                             eg3doutput_denoised_ema=latent2img_fn(unet_output.sample)
@@ -1733,7 +1725,7 @@ def generate_images():
                                         reverse_process_list_text_split,denoised_ddim_text_split=\
                                                 reverse_process(latent2img_fn,timesteps,noise_scheduler,noise_sample,unet_val,encoder_states_text,camera_params,
                                                                 G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='cfg',return_pred=True,
-                                                                return_latents=True,i_end=None)
+                                                                return_latents=True,i_end=40)
                                         denoised_ddim_text.append(denoised_ddim_text_split)
                                     # denoised_ddim_text shape: (additional_sample//batch_size, batch_size, 96, 256, 256)
 
