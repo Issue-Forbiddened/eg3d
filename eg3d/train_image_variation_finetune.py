@@ -571,7 +571,7 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        '--network_pkl', help='Network pickle filename', required=False,default='/home/junyi/eg3d/eg3d/pretrained_models/ffhqrebalanced512-128.pkl'
+        '--network_pkl', help='Network pickle filename', required=False,default='/home1/jo_891/data1/eg3d/ffhqrebalanced512-128.pkl'
     )
     parser.add_argument(
         '--truncation_psi', type=float, help='Truncation psi', default=0.7
@@ -604,8 +604,11 @@ def parse_args():
     # additional_sample int
     parser.add_argument("--additional_sample", type=int, default=0, help="The additional sample to generate.")
 
-    # scaled bool, default true
+    # scaled bool, default false
     parser.add_argument("--scaled", action="store_true", help="Whether to scaled.")
+
+    # lora bool, default false
+    parser.add_argument("--lora", action="store_true", help="Whether to lora.")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -1032,7 +1035,8 @@ def generate_images():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-        
+    if args.use_ema:
+        assert not args.lora, "LoRA is not supported with EMA."
 
     unet_id="lambdalabs/sd-image-variations-diffusers"
     unet=UNet2DConditionModel.from_pretrained(unet_id,
@@ -1040,19 +1044,20 @@ def generate_images():
                                               torch_dtype=torch.float32).cuda()
     unet=expand_unet(unet,unet_id)
 
-    # Freeze the unet parameters before adding adapters
-    for param in unet.parameters():
-        param.requires_grad_(False)
+    if args.lora:
+        # Freeze the unet parameters before adding adapters
+        for param in unet.parameters():
+            param.requires_grad_(False)
 
-    unet_lora_config = LoraConfig(
-        r=4,
-        lora_alpha=4,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-    )
+        unet_lora_config = LoraConfig(
+            r=4,
+            lora_alpha=4,
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        )
 
-    # Add adapter and make sure the trainable params are in float32.
-    unet.add_adapter(unet_lora_config)
+        # Add adapter and make sure the trainable params are in float32.
+        unet.add_adapter(unet_lora_config)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -1067,13 +1072,18 @@ def generate_images():
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
-    lora_layers = list(filter(lambda p: p.requires_grad, unet.parameters()))
+    if args.lora:
+        lora_layers = list(filter(lambda p: p.requires_grad, unet.parameters()))
 
-    for param in unet.conv_in.parameters():
-        param.requires_grad_(True)
+        for param in unet.conv_in.parameters():
+            param.requires_grad_(True)
 
-    for param in unet.conv_out.parameters():
-        param.requires_grad_(True)
+        for param in unet.conv_out.parameters():
+            param.requires_grad_(True)
+    
+    else:
+        for param in unet.parameters():
+            param.requires_grad_(True)
 
     if args.mixed_precision == "fp16":
         for param in unet.parameters():
@@ -1144,9 +1154,23 @@ def generate_images():
     noise_scheduler = diffusers.schedulers.DDPMScheduler.from_pretrained(unet_id, subfolder="scheduler")
 
     params=[]
-    conv_params={'params':list(unet.conv_in.parameters())+list(unet.conv_out.parameters()),'lr':10*args.learning_rate}
-    params.append(conv_params)
-    params.append({'params':(lora_layers),'lr':args.learning_rate})
+
+    if args.lora:
+        conv_params={'params':list(unet.conv_in.parameters())+list(unet.conv_out.parameters()),'lr':10*args.learning_rate}
+        params.append(conv_params)
+        params.append({'params':(lora_layers),'lr':args.learning_rate})
+    else:
+        params.append({'params':list(unet.conv_in.parameters())+list(unet.conv_out.parameters()),'lr':10*args.learning_rate})
+        # get all parameters from unet except conv_in and conv_out
+        # 获取conv_in和conv_out的所有参数ID
+        exclude_params = {id(p) for p in list(unet.conv_in.parameters()) + list(unet.conv_out.parameters())}
+
+        # 生成参数列表，排除特定的参数
+        filtered_params = (p for p in unet.parameters() if id(p) not in exclude_params)
+
+        # 将筛选后的参数添加到参数组中
+        params.append({'params': filtered_params, 'lr': args.learning_rate})
+
 
    # Initialize the optimizer
     if args.use_8bit_adam:
@@ -1496,12 +1520,9 @@ def generate_images():
 
                 ws = G.mapping(z_generator, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
                 planes=G.get_planes(ws) # (batch_size,96,256,256)
-
-                planes=F.interpolate(planes,(64,64),mode='bilinear',align_corners=False)
                 
                 eg3doutput=G.render_from_planes(camera_params,planes)
                 
-
                 if args.multiview:
                     mv_number=2
                     cam2world_pose_mv=UniformCameraPoseSampler.sample(np.pi/2, np.pi/2 , horizontal_stddev=np.pi/4,vertical_stddev=np.pi/4,
@@ -1512,6 +1533,7 @@ def generate_images():
                     planes_mv=planes.repeat(mv_number,1,1,1)
                     eg3doutput_mv=G.render_from_planes(camera_params_mv,planes_mv)
             
+            planes=F.interpolate(planes,(64,64),mode='bilinear',align_corners=False)
             latents=normalize_fn(planes)
 
             noise=torch.randn_like(latents)
@@ -1702,20 +1724,20 @@ def generate_images():
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         
+
                         unwrapped_unet = accelerator.unwrap_model(unet)
-                        unet_lora_state_dict = get_peft_model_state_dict(unwrapped_unet)
-
-                        diffusers.StableDiffusionPipeline.save_lora_weights(
-                            save_directory=save_path,
-                            unet_lora_layers=unet_lora_state_dict,
-                            safe_serialization=True,
-                        )
-
                         save_expanded_unet(unwrapped_unet, save_path)
 
+                        if args.lora:
+                            unet_lora_state_dict = get_peft_model_state_dict(unwrapped_unet)
+
+                            diffusers.StableDiffusionPipeline.save_lora_weights(
+                                save_directory=save_path,
+                                unet_lora_layers=unet_lora_state_dict,
+                                safe_serialization=True,
+                            )
+
                         logger.info(f"Saved state to {save_path}")
-
-
 
                         # 保存当前的py到checkpoint
                         shutil.copy(os.path.join(args.output_dir,"train_control3diff_tmp_{}.py".format(str(file_idx))), save_path)
@@ -1749,19 +1771,30 @@ def generate_images():
                         eg3doutput_denoised=latent2img_fn(pred_x0[:4])
                         img_concat=torch.cat([eg3doutput_, eg3doutput_noisy,eg3doutput_denoised],dim=2) # (batch_size,256,768,3)
                         print('img_concat shape:',img_concat.shape)
-                        if args.adv:
-                            pass
 
+                        noise_scheduler.set_timesteps(args.num_inference_steps, device=device)
+                        timesteps = noise_scheduler.timesteps
+                        original_latents=latents.detach().clone()
+                        latents=noise.detach().clone()
+                        
+                        unet_val=accelerator.unwrap_model(unet)
+                        encoder_val=encoder   
+                    
+                        reverse_process_list,denoised_ddim=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise[:4],unet_val,encoder_states[:4],camera_params[:4],
+                                                            G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type='normal',return_pred=True,return_latents=True)
+                        eg3doutput_denoised_ema_multistep=reverse_process_list[-1]
+                        img_concat=torch.cat([img_concat, eg3doutput_denoised_ema_multistep],dim=2)
+                        reverse_process_list=torch.cat(reverse_process_list,dim=2).flatten(0,1)
+                        accelerator.log({'reverse_process':wandb.Image(reverse_process_list.numpy())},step=global_step)
+                        del reverse_process_list
+                        
                         if args.use_ema:
                             if False:
                                 ema_unet.store(unet.parameters())
-                                ema_unet.copy_to(unet.parameters())
-                                # ema_encoder.store(encoder.parameters())
-                                # ema_encoder.copy_to(encoder.parameters())
-                                
+                                ema_unet.copy_to(unet.parameters())                           
+
                                 unet_val=accelerator.unwrap_model(unet)
-                                # encoder_val=accelerator.unwrap_model(encoder)
-                                encoder_val=encoder
+                                encoder_val=encoder     
 
                                 encoder_states=encoder_val(clip_normalize_fn(eg3doutput['image'].detach()))
                                 # encoder_states=encoder_states/encoder_states.norm(dim=-1,keepdim=True)
@@ -2078,4 +2111,4 @@ if __name__ == "__main__":
 
 # accelerate launch --mixed_precision=fp16 train_control3diff_clip.py --train_batch_size=4 --log_step_interval=5000 --checkpointing_steps=7500 --use_ema --resume_from_checkpoint=latest --output=control3diff_trained_clip_retrain --scaled --verify_text='Close-up of a young male with bright green eyes, short blond hair, and a clean-shaven face, showing a neutral expression' --additional_sample=16
 
-# accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=16 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=image_variation_finetune --wandb_offline
+# accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=8 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=image_variation_finetune --wandb_offline  --prediction_type=epsilon
