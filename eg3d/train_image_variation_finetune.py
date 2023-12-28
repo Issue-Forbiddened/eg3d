@@ -1126,6 +1126,47 @@ def generate_images():
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
+    # `accelerate` 0.16.0 will have better support for customized saving
+    if not args.lora:
+        if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
+            # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+            def save_model_hook(models, weights, output_dir):
+                # SAVE
+                if accelerator.is_main_process:
+                    if args.use_ema:
+                        # ema_encoder.save_pretrained(os.path.join(output_dir, "encoder_ema"))
+                        ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+
+                    for i, model in enumerate(models):
+                        if isinstance(model, UNet2DConditionModel):
+                            model.save_pretrained(os.path.join(output_dir, "unet"))
+                        # make sure to pop weight so that corresponding model is not saved again
+                        weights.pop()
+
+            def load_model_hook(models, input_dir):
+                # LOAD
+                if args.use_ema:
+                    load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
+                    ema_unet.load_state_dict(load_model.state_dict())
+                    ema_unet.to(accelerator.device)
+                    del load_model
+
+                for i in range(len(models)):
+                    # pop models so that they are not loaded again
+                    model = models.pop()
+
+                    # load diffusers style into model
+                    if isinstance(model, UNet2DConditionModel):
+                        load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                    model.register_to_config(**load_model.config)
+
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
+
+            accelerator.register_save_state_pre_hook(save_model_hook)
+            accelerator.register_load_state_pre_hook(load_model_hook)
+
+
     print('Loading networks from "%s"...' % network_pkl)
 
     with dnnlib.util.open_url(network_pkl) as f:
@@ -1151,7 +1192,7 @@ def generate_images():
     cam2world_pose = LookAtPoseSampler.sample(3.14/2, 3.14/2, torch.tensor([0, 0, 0.2], device=device), radius=2.7, device=device)
     intrinsics = FOV_to_intrinsics(fov_deg, device=device)
 
-    noise_scheduler = diffusers.schedulers.DDPMScheduler.from_pretrained(unet_id, subfolder="scheduler")
+    noise_scheduler = diffusers.schedulers.DDIMScheduler.from_pretrained(unet_id, subfolder="scheduler")
 
     params=[]
 
@@ -1219,12 +1260,9 @@ def generate_images():
         tracker_config = dict(vars(args))
         init_kwargs={'wandb':{'mode':'offline'}} if args.wandb_offline else {}
         accelerator.init_trackers(args.tracker_project_name, tracker_config,init_kwargs)
-
+    
     num_cross_attention_block=sum([1 for block in unet.down_blocks if getattr(block, "has_cross_attention", False)] +[1])
 
-    # unet, optimizer, lr_scheduler, encoder = accelerator.prepare(
-    #     unet, optimizer, lr_scheduler, encoder
-    # )
 
     unet, optimizer, lr_scheduler = accelerator.prepare(
         unet, optimizer, lr_scheduler
@@ -1280,7 +1318,7 @@ def generate_images():
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(os.path.join(args.output_dir, path))
-            load_expanded_unet(accelerator.unwrap_model(unet), os.path.join(args.output_dir, path), device=device)
+
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step
@@ -1722,13 +1760,11 @@ def generate_images():
                                     shutil.rmtree(removing_checkpoint)
                         
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        
-
-                        unwrapped_unet = accelerator.unwrap_model(unet)
-                        save_expanded_unet(unwrapped_unet, save_path)
+                        accelerator.save_state(save_path)        
 
                         if args.lora:
+                            unwrapped_unet = accelerator.unwrap_model(unet)
+                            save_expanded_unet(unwrapped_unet, save_path)
                             unet_lora_state_dict = get_peft_model_state_dict(unwrapped_unet)
 
                             diffusers.StableDiffusionPipeline.save_lora_weights(

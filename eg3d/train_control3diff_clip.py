@@ -929,7 +929,7 @@ def generate_images():
         'down_sampling_ratio':1,
         'use_linear_projection':True,
         'only_cross_attention':(True,True,False,False,False,False),
-                                          }
+        }
     
     unet=UNet2DConditionModel_downsample(**unet_config)
 
