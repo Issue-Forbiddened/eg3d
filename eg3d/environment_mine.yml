@@ -187,7 +187,6 @@ dependencies:
       - cachetools==5.3.2
       - comm==0.2.0
       - decorator==4.4.2
-      - diffusers==0.25.0.dev0
       - docker-pycreds==0.4.0
       - exceptiongroup==1.2.0
       - executing==2.0.1
