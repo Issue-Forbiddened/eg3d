@@ -40,7 +40,7 @@ from accelerate import Accelerator
 import logging
 from diffusers.training_utils import EMAModel
 from accelerate.logging import get_logger
-from diffusers import UNet2DConditionModel,StableDiffusionImageVariationPipeline
+from diffusers import UNet2DConditionModel,StableDiffusionImageVariationPipeline,StableDiffusionPipeline
 import shutil
 import argparse
 from accelerate.utils import ProjectConfiguration
@@ -66,6 +66,8 @@ from peft.utils import get_peft_model_state_dict
 from diffusers.utils.import_utils import is_xformers_available
 
 from functools import partial
+
+from diffusers import ControlNetModel
 
 # import matplotlib.pyplot as plt
 #----------------------------------------------------------------------------
@@ -610,6 +612,12 @@ def parse_args():
     # lora bool, default false
     parser.add_argument("--lora", action="store_true", help="Whether to lora.")
 
+    # controlnet bool, default false
+    parser.add_argument("--controlnet", action="store_true", help="Whether to controlnet.")
+
+    # backbone bool, default false
+    parser.add_argument("--backbone", action="store_true", help="Whether to backbone.")
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -1036,13 +1044,21 @@ def generate_images():
             os.makedirs(args.output_dir, exist_ok=True)
 
     if args.use_ema:
-        assert not args.lora, "LoRA is not supported with EMA."
+        logger.info("EMA is not supported in this code.")
 
     unet_id="lambdalabs/sd-image-variations-diffusers"
     unet=UNet2DConditionModel.from_pretrained(unet_id,
                                               subfolder='unet',
                                               torch_dtype=torch.float32).cuda()
     unet=expand_unet(unet,unet_id)
+    unet.requires_grad_(False)
+
+    # args.lora, args.controlnet, args.backbone should only have one True
+    assert sum([args.lora, args.controlnet, args.backbone]) <= 1, "Only one of lora, controlnet, backbone can be True."
+
+    if sum([args.lora, args.controlnet, args.backbone]) ==0:
+        args.backbone=True
+        logger.info("No args.lora, args.controlnet, args.backbone is True, set args.backbone=True.")
 
     if args.lora:
         # Freeze the unet parameters before adding adapters
@@ -1057,22 +1073,8 @@ def generate_images():
         )
 
         # Add adapter and make sure the trainable params are in float32.
-        unet.add_adapter(unet_lora_config)
+        unet.add_adapter(unet_lora_config,adapter_name='default_1') #adapter_name is important because some bugs in lora's loading codes.
 
-    if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            import xformers
-
-            xformers_version = version.parse(xformers.__version__)
-            if xformers_version == version.parse("0.0.16"):
-                logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-                )
-            unet.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
-
-    if args.lora:
         lora_layers = list(filter(lambda p: p.requires_grad, unet.parameters()))
 
         for param in unet.conv_in.parameters():
@@ -1080,20 +1082,22 @@ def generate_images():
 
         for param in unet.conv_out.parameters():
             param.requires_grad_(True)
-    
-    else:
-        for param in unet.parameters():
-            param.requires_grad_(True)
 
-    if args.mixed_precision == "fp16":
         for param in unet.parameters():
             # only upcast trainable parameters (LoRA) into fp32
             if param.requires_grad:
-                param.data = param.to(torch.float32)
+                param.data = param.data.to(torch.float32)
 
-    if args.use_ema:
-        ema_unet = EMAModel(unet.parameters(), model_cls=UNet2DConditionModel, model_config=unet.config)
-
+    if args.controlnet:
+        controlnet = ControlNetModel.from_unet(unet)
+        controlnet = controlnet.to(device=device, dtype=torch.float32)
+        controlnet.train()
+        controlnet.requires_grad_(True)
+    
+    if args.backbone:
+        unet.requires_grad_(True)
+    
+    unet.train()
 
     clip=CLIPModel.from_pretrained('openai/clip-vit-large-patch14').to(device)
     clip.requires_grad_(False)
@@ -1102,10 +1106,8 @@ def generate_images():
     processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
     clip_normalize_fn= lambda x:processor(images=(x*127.5+128).clamp(0,255).to(torch.uint8),return_tensors='pt').pixel_values.to(device) #假设输入是-1~1
     if args.verify_text: 
-        # text_encoder=CLIPTextModel.from_pretrained('CompVis/stable-diffusion-v1-4',subfolder='text_encoder').to(device)
-        # text_encoder.requires_grad_(False)
         tokenizer=CLIPTokenizer.from_pretrained('openai/clip-vit-large-patch14')
-        with torch.no_grad/():
+        with torch.no_grad():
             text_inputs = tokenizer(
                 args.verify_text,
                 padding="max_length",
@@ -1127,44 +1129,57 @@ def generate_images():
         )
 
     # `accelerate` 0.16.0 will have better support for customized saving
-    if not args.lora:
-        if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-            # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-            def save_model_hook(models, weights, output_dir):
-                # SAVE
-                if accelerator.is_main_process:
-                    if args.use_ema:
-                        # ema_encoder.save_pretrained(os.path.join(output_dir, "encoder_ema"))
-                        ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
-
-                    for i, model in enumerate(models):
-                        if isinstance(model, UNet2DConditionModel):
-                            model.save_pretrained(os.path.join(output_dir, "unet"))
-                        # make sure to pop weight so that corresponding model is not saved again
-                        weights.pop()
-
-            def load_model_hook(models, input_dir):
-                # LOAD
-                if args.use_ema:
-                    load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
-                    ema_unet.load_state_dict(load_model.state_dict())
-                    ema_unet.to(accelerator.device)
-                    del load_model
-
-                for i in range(len(models)):
-                    # pop models so that they are not loaded again
-                    model = models.pop()
-
-                    # load diffusers style into model
+    if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
+        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+        def save_model_hook(models, weights, output_dir):
+            # SAVE
+            if accelerator.is_main_process:
+                for i, model in enumerate(models):
                     if isinstance(model, UNet2DConditionModel):
+                        if args.backbone:
+                            model.save_pretrained(os.path.join(output_dir, "unet"))
+                    elif isinstance(model, ControlNetModel):
+                        model.save_pretrained(os.path.join(output_dir, "controlnet"))
+                    
+                    weights.pop()
+
+
+        def load_model_hook(models, input_dir):
+
+            for i in range(len(models)):
+                # pop models so that they are not loaded again
+                model = models.pop()
+
+                # load diffusers style into model
+                if isinstance(model, UNet2DConditionModel):
+                    if args.backbone:
                         load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
-                    model.register_to_config(**load_model.config)
+                    else:
+                        continue
+                elif isinstance(model, ControlNetModel):
+                    load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+                model.register_to_config(**load_model.config)
 
-                    model.load_state_dict(load_model.state_dict())
-                    del load_model
+                model.load_state_dict(load_model.state_dict())
+                del load_model
 
-            accelerator.register_save_state_pre_hook(save_model_hook)
-            accelerator.register_load_state_pre_hook(load_model_hook)
+        accelerator.register_save_state_pre_hook(save_model_hook)
+        accelerator.register_load_state_pre_hook(load_model_hook)
+
+    if args.enable_xformers_memory_efficient_attention:
+        if is_xformers_available():
+            import xformers
+
+            xformers_version = version.parse(xformers.__version__)
+            if xformers_version == version.parse("0.0.16"):
+                logger.warn(
+                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                )
+            unet.enable_xformers_memory_efficient_attention()
+            controlnet.enable_xformers_memory_efficient_attention()
+        else:
+            raise ValueError("xformers is not available. Make sure it is installed correctly")
+
 
 
     print('Loading networks from "%s"...' % network_pkl)
@@ -1195,14 +1210,15 @@ def generate_images():
     noise_scheduler = diffusers.schedulers.DDIMScheduler.from_pretrained(unet_id, subfolder="scheduler")
 
     params=[]
-
+    conv_params={'params':list(unet.conv_in.parameters())+list(unet.conv_out.parameters()),'lr':10*args.learning_rate}
+    params.append(conv_params)
     if args.lora:
-        conv_params={'params':list(unet.conv_in.parameters())+list(unet.conv_out.parameters()),'lr':10*args.learning_rate}
-        params.append(conv_params)
         params.append({'params':(lora_layers),'lr':args.learning_rate})
-    else:
-        params.append({'params':list(unet.conv_in.parameters())+list(unet.conv_out.parameters()),'lr':10*args.learning_rate})
-        # get all parameters from unet except conv_in and conv_out
+
+    if args.controlnet:
+        params.append({'params':controlnet.parameters(),'lr':args.learning_rate})
+
+    if args.backbone:
         # 获取conv_in和conv_out的所有参数ID
         exclude_params = {id(p) for p in list(unet.conv_in.parameters()) + list(unet.conv_out.parameters())}
 
@@ -1268,9 +1284,8 @@ def generate_images():
         unet, optimizer, lr_scheduler
     )
 
-    if args.use_ema:
-        ema_unet.to(accelerator.device)
-        # ema_encoder.to(accelerator.device)
+    if args.controlnet:
+        controlnet = accelerator.prepare(controlnet)
 
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -1318,9 +1333,31 @@ def generate_images():
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(os.path.join(args.output_dir, path))
-
-            if args.lora:
-                load_expanded_unet(unet, os.path.join(args.output_dir, path), device=device)
+            # debug_record1=unet.conv_in.weight.data.clone().detach()
+            if not args.backbone: #如果训练整个网络,在上一步就完成了checkpoint的加载
+                load_expanded_unet(accelerator.unwrap_model(unet), os.path.join(args.output_dir, path), device=device)
+                # debug_record=lora_layers[0].data.clone().detach()
+                if args.lora:
+                    from peft import set_peft_model_state_dict
+                    lora_state_dict, lora_network_alphas = \
+                        StableDiffusionPipeline.lora_state_dict(
+                            os.path.join(args.output_dir,path,'lora'),
+                            weight_name='pytorch_lora_weights.safetensors'
+                            )
+                    keys = list(lora_state_dict.keys())
+                    unet_keys = [k for k in keys if k.startswith('unet')]
+                    lora_state_dict = {k.replace(f"unet.", ""): v for k, v in lora_state_dict.items() if k in unet_keys}           
+                    set_peft_model_state_dict(accelerator.unwrap_model(unet), lora_state_dict, adapter_name='default_1') # does things
+                    # debug_record2=lora_layers[0].data.clone().detach()
+                    accelerator.unwrap_model(unet).load_attn_procs(
+                        lora_state_dict, network_alphas=None, low_cpu_mem_usage=True, _pipeline=None
+                    ) # does nothing
+                    
+                    # StableDiffusionPipeline.load_lora_into_unet(lora_state_dict,
+                    #                                             lora_network_alphas,
+                    #                                             accelerator.unwrap_model(unet))
+                elif args.controlnet:
+                    pass # controlnet is loaded in the accelerator.load_state
 
             global_step = int(path.split("-")[1])
 
@@ -1414,19 +1451,6 @@ def generate_images():
     mean_load=torch.tensor(stats_dict['mean'],device=device,dtype=weight_dtype).reshape(1,96,64,64)
     std_load=torch.tensor(stats_dict['std'],device=device,dtype=weight_dtype).reshape(1,96,64,64)
 
-    # mean_load_64=torch.zeros([1,96,64,64], device=device,dtype=weight_dtype)
-    # std_load_64=torch.zeros([1,96,64,64], device=device,dtype=weight_dtype)
-
-    # for i in range(64):
-    #     for j in range(64):
-    #         mean_load_64[:,:,i,j]=mean_load[:,:,4*i:4*i+4,4*j:4*j+4].mean(dim=(2,3))
-    #         # std_load_64[:,:,i,j]=std_load[:,:,4*i:4*i+4,4*j:4*j+4].mean(dim=(2,3))*4
-    #         # std(x)=sqrt(sum(Var(x_ori))/(n^2))
-    #         std_load_64[:,:,i,j]=(std_load[:,:,4*i:4*i+4,4*j:4*j+4]**2).sum(dim=(2,3)).sqrt()/16
-
-    # mean_load=mean_load_64
-    # std_load=std_load_64
-
     
 
     if args.scaled:
@@ -1441,79 +1465,6 @@ def generate_images():
         raise ValueError('mean has nan value')
     if std_load.isnan().any():
         raise ValueError('std has nan value')
-    
-    if False:
-        if accelerator.is_main_process:
-            total_sample=10000
-            minibatch=128
-            total_batch=total_sample//minibatch
-            sample_count=0
-            mean = torch.zeros([96, 256, 256], device=device,dtype=torch.float64)
-            M2 = torch.zeros([96, 256, 256], device=device,dtype=torch.float64)
-            with torch.no_grad():
-                for idx in tqdm(range(total_batch),desc='getting scale:'):
-                    z_generator=torch.randn(minibatch, G.z_dim, device=device)
-                    cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
-                    cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
-                    cam2world_pose=UniformCameraPoseSampler.sample(np.pi/2, np.pi/2 , horizontal_stddev=np.pi/4,vertical_stddev=np.pi/4,
-                        lookat_position=torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device), 
-                        radius=G.rendering_kwargs.get('avg_camera_radius', 2.7), device=device,batch_size=minibatch)
-                    conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device,batch_size=minibatch)
-                    camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
-                    conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
-
-                    ws = G.mapping(z_generator, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-                    planes=G.get_planes(ws) # (batch_size,96,256,256)
-                    planes= planes.to(torch.float64)
-                    planes = normalize_fn(planes)
-                    # planes=torch.tanh(planes).to(torch.float64)
-
-                    if not torch.isnan(planes).any():
-                        sample_count += minibatch
-                        delta = planes - mean
-                        mean += delta.sum(dim=0) / sample_count
-                        M2 += (1/sample_count)*((sample_count-minibatch)/(sample_count)*((delta**2).sum(dim=0))-M2)
-
-            print(f'mean:{mean.mean().item()},std:{torch.sqrt(M2).mean().item()}')
-
-    if False:
-        if accelerator.is_main_process:
-            total_sample=10000
-            minibatch=64
-            total_batch=total_sample//minibatch
-            sample_count=0
-            mean = torch.zeros([96, 256, 256], device=device,dtype=torch.float64)
-            M2 = torch.zeros([96, 256, 256], device=device,dtype=torch.float64)
-            ABS_MAX=torch.zeros([96, 256, 256], device=device,dtype=torch.float64)
-            with torch.no_grad():
-                for idx in tqdm(range(total_batch),desc='getting scale:'):
-                    z_generator=torch.randn(minibatch, G.z_dim, device=device)
-                    cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
-                    cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
-                    cam2world_pose=UniformCameraPoseSampler.sample(np.pi/2, np.pi/2 , horizontal_stddev=np.pi/4,vertical_stddev=np.pi/4,
-                        lookat_position=torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device), 
-                        radius=G.rendering_kwargs.get('avg_camera_radius', 2.7), device=device,batch_size=minibatch)
-                    conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device,batch_size=minibatch)
-                    camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
-                    conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
-
-                    ws = G.mapping(z_generator, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-                    planes=G.get_planes(ws) # (batch_size,96,256,256)
-                    planes= planes.to(torch.float64)
-                    planes = normalize_fn(planes)
-                    ABS_MAX=torch.max(ABS_MAX,torch.abs(planes))
-                    # planes=torch.tanh(planes).to(torch.float64)
-
-                    if not torch.isnan(planes).any():
-                        sample_count += minibatch
-                        delta = planes - mean
-                        mean += delta.sum(dim=0) / sample_count
-                        M2 += (1/sample_count)*((sample_count-minibatch)/(sample_count)*((delta**2).sum(dim=0))-M2)
-            stats_dict['max']=ABS_MAX.cpu().numpy().tolist()
-            print(f'mean:{mean.mean().item()},std:{torch.sqrt(M2).mean().item()}')
-            with open(os.path.join(args.output_dir,'stats_dict.json'),'w') as f:
-                json.dump(stats_dict,f)
-
 
     accelerator.wait_for_everyone()
 
@@ -1590,7 +1541,23 @@ def generate_images():
                 if encoder_output_shape is None:
                     encoder_output_shape=encoder_states.shape
 
-            unet_output=unet(noisy_latents,timesteps,encoder_states)
+            controlnet_image=(eg3doutput['image'].detach()).to(dtype=weight_dtype)
+            down_block_res_samples, mid_block_res_sample = controlnet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=encoder_states,
+                controlnet_cond=controlnet_image,
+                return_dict=False,
+            )     
+
+            unet_output=unet(noisy_latents,
+                             timesteps,
+                             encoder_hidden_states=encoder_states,
+                             down_block_additional_residuals=[
+                                sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+                             ],
+                             mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
+            )
         
             if noise_scheduler.config.prediction_type == "epsilon":
                 target = noise
@@ -1717,8 +1684,9 @@ def generate_images():
             avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
             train_loss += avg_loss.item() / args.gradient_accumulation_steps
             accelerator.backward(loss)
+
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(list(unet.parameters()), args.max_grad_norm)
+                accelerator.clip_grad_norm_(sum([group['params'] for group in optimizer.param_groups if group['lr']>0],[]),     args.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
             lr_scheduler.step()
@@ -1729,15 +1697,11 @@ def generate_images():
                 miscs_list[k].append(v)
 
             if accelerator.sync_gradients:
-                if args.use_ema:
-                    ema_unet.step(unet.parameters())
-                    # ema_encoder.step(encoder.parameters())
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 for k,v in losses.items():
                     accelerator.log({k: v.detach().item()}, step=global_step)
                 train_loss = 0.0
-
 
                 if global_step % args.checkpointing_steps == 0 or not sanity_checked:
                 # if global_step % args.checkpointing_steps == 0:
@@ -1765,16 +1729,21 @@ def generate_images():
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)        
 
-                        if args.lora:
+                        if not args.backbone:
                             unwrapped_unet = accelerator.unwrap_model(unet)
                             save_expanded_unet(unwrapped_unet, save_path)
-                            unet_lora_state_dict = get_peft_model_state_dict(unwrapped_unet)
+                            if args.lora:
+                                unet_lora_state_dict = get_peft_model_state_dict(unwrapped_unet,adapter_name='default_1')
 
-                            diffusers.StableDiffusionPipeline.save_lora_weights(
-                                save_directory=save_path,
-                                unet_lora_layers=unet_lora_state_dict,
-                                safe_serialization=True,
-                            )
+                                lora_save_path=os.path.join(save_path,'lora')
+
+                                diffusers.StableDiffusionPipeline.save_lora_weights(
+                                    save_directory=lora_save_path,
+                                    unet_lora_layers=unet_lora_state_dict,
+                                    safe_serialization=True,
+                                )
+                            elif args.controlnet:
+                                pass
 
                         logger.info(f"Saved state to {save_path}")
 
@@ -1784,8 +1753,6 @@ def generate_images():
                         with open(os.path.join(save_path,'args.json'),'w') as f:
                             json.dump(vars(args),f)
 
-
-
                         if args.adv:
                             # save D
                             D.save_pretrained(os.path.join(save_path,"discriminator"))
@@ -1793,11 +1760,12 @@ def generate_images():
                             torch.save(optimizer_D.state_dict(), os.path.join(save_path,'discriminator',f"optimizer_D_{global_step}.bin"))
                             # save lr_scheduler_D
                             torch.save(lr_scheduler_D.state_dict(), os.path.join(save_path,'discriminator',f"lr_scheduler_D_{global_step}.bin"))
-                        if not sanity_checked:
-                            shutil.rmtree(save_path)
+                        # if not sanity_checked:
+                        #     shutil.rmtree(save_path)
 
 
-            if global_step%log_step_interval==0 or not sanity_checked:
+            if global_step%log_step_interval==0 or not sanity_checked:   
+            # if global_step % args.checkpointing_steps == 0:
                 if accelerator.is_main_process:
                     unet.eval()
                     with torch.no_grad():
@@ -1827,11 +1795,8 @@ def generate_images():
                         accelerator.log({'reverse_process':wandb.Image(reverse_process_list.numpy())},step=global_step)
                         del reverse_process_list
                         
-                        if args.use_ema:
-                            if False:
-                                ema_unet.store(unet.parameters())
-                                ema_unet.copy_to(unet.parameters())                           
-
+                        if True:
+                            if False:                      
                                 unet_val=accelerator.unwrap_model(unet)
                                 encoder_val=encoder     
 
@@ -2114,9 +2079,6 @@ def generate_images():
                                     # Release the VideoWriter object
                                     out.release()
 
-
-                                ema_unet.restore(unet.parameters())
-                                # ema_encoder.restore(encoder.parameters()) 
                         # save to wandb
                         img_concat=img_concat.flatten(0,1) 
                         accelerator.log({'origin_noised_denoised_denoisedema_(denoised_none_condition)_denoisedemamultistep':wandb.Image(img_concat.cpu().numpy())},step=global_step)
@@ -2151,3 +2113,5 @@ if __name__ == "__main__":
 # accelerate launch --mixed_precision=fp16 train_control3diff_clip.py --train_batch_size=4 --log_step_interval=5000 --checkpointing_steps=7500 --use_ema --resume_from_checkpoint=latest --output=control3diff_trained_clip_retrain --scaled --verify_text='Close-up of a young male with bright green eyes, short blond hair, and a clean-shaven face, showing a neutral expression' --additional_sample=16
 
 # accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=8 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=image_variation_finetune --wandb_offline  --prediction_type=epsilon
+    
+# accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=2 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=image_variation_finetune_test --wandb_offline  --prediction_type=epsilon
