@@ -1793,8 +1793,8 @@ def generate_images():
                             torch.save(optimizer_D.state_dict(), os.path.join(save_path,'discriminator',f"optimizer_D_{global_step}.bin"))
                             # save lr_scheduler_D
                             torch.save(lr_scheduler_D.state_dict(), os.path.join(save_path,'discriminator',f"lr_scheduler_D_{global_step}.bin"))
-                        # if not sanity_checked:
-                        #     shutil.rmtree(save_path)
+                        if not sanity_checked:
+                            shutil.rmtree(save_path)
 
 
             if global_step%log_step_interval==0 or not sanity_checked:
