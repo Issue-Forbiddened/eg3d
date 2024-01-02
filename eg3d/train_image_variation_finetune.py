@@ -573,7 +573,7 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        '--network_pkl', help='Network pickle filename', required=False,default='/home/junyi/eg3d/eg3d/pretrained_models/ffhqrebalanced512-128.pkl'
+        '--network_pkl', help='Network pickle filename', required=False,default='/home1/jo_891/data1/eg3d/ffhqrebalanced512-128.pkl'
     )
     parser.add_argument(
         '--truncation_psi', type=float, help='Truncation psi', default=0.7
@@ -617,6 +617,9 @@ def parse_args():
 
     # backbone bool, default false
     parser.add_argument("--backbone", action="store_true", help="Whether to backbone.")
+
+    # freeze_attentions bool, default false
+    parser.add_argument("--freeze_attentions", action="store_true", help="Whether to freeze_attentions.")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -1056,9 +1059,13 @@ def generate_images():
     # args.lora, args.controlnet, args.backbone should only have one True
     assert sum([args.lora, args.controlnet, args.backbone]) <= 1, "Only one of lora, controlnet, backbone can be True."
 
+
     if sum([args.lora, args.controlnet, args.backbone]) ==0:
         args.backbone=True
         logger.info("No args.lora, args.controlnet, args.backbone is True, set args.backbone=True.")
+
+    if args.freeze_attentions:
+        assert args.backbone, "args.backbone should be True when args.freeze_attentions is True."
 
     if args.lora:
         # Freeze the unet parameters before adding adapters
@@ -1096,6 +1103,10 @@ def generate_images():
     
     if args.backbone:
         unet.requires_grad_(True)
+        if args.freeze_attentions:
+            for name, param in unet.named_parameters():
+                if "attention" in name:
+                    param.requires_grad_(False)
     
     unet.train()
 
@@ -1221,12 +1232,18 @@ def generate_images():
     if args.backbone:
         # 获取conv_in和conv_out的所有参数ID
         exclude_params = {id(p) for p in list(unet.conv_in.parameters()) + list(unet.conv_out.parameters())}
+        if args.freeze_attentions:
+            # 获取所有注意力模块的参数ID
+            for name, param in unet.named_parameters():
+                if "attention" in name:
+                    exclude_params.add(id(param))
 
         # 生成参数列表，排除特定的参数
         filtered_params = (p for p in unet.parameters() if id(p) not in exclude_params)
 
         # 将筛选后的参数添加到参数组中
         params.append({'params': filtered_params, 'lr': args.learning_rate})
+
 
 
    # Initialize the optimizer
@@ -2119,6 +2136,6 @@ if __name__ == "__main__":
 
 # accelerate launch --mixed_precision=fp16 train_control3diff_clip.py --train_batch_size=4 --log_step_interval=5000 --checkpointing_steps=7500 --use_ema --resume_from_checkpoint=latest --output=control3diff_trained_clip_retrain --scaled --verify_text='Close-up of a young male with bright green eyes, short blond hair, and a clean-shaven face, showing a neutral expression' --additional_sample=16
 
-# accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=8 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=image_variation_finetune --wandb_offline  --prediction_type=epsilon
+# accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=image_variation_finetune --wandb_offline  --prediction_type=epsilon --backbone --freeze_attentions
     
 # accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=2 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=image_variation_finetune_test --wandb_offline  --prediction_type=epsilon
