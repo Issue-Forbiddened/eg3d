@@ -1543,7 +1543,6 @@ def generate_images():
 
             if args.controlnet:
                 controlnet_image=(eg3doutput['image'].detach()).to(dtype=weight_dtype)
-                controlnet_image=torch.zeros_like(controlnet_image)
 
                 down_block_res_samples, mid_block_res_sample = controlnet(
                         noisy_latents,
