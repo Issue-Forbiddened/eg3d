@@ -573,7 +573,7 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        '--network_pkl', help='Network pickle filename', required=False,default='/home1/jo_891/data1/eg3d/ffhqrebalanced512-128.pkl'
+        '--network_pkl', help='Network pickle filename', required=False,default='/home/junyi/eg3d/eg3d/pretrained_models/ffhqrebalanced512-128.pkl'
     )
     parser.add_argument(
         '--truncation_psi', type=float, help='Truncation psi', default=0.7
@@ -1541,23 +1541,31 @@ def generate_images():
                 if encoder_output_shape is None:
                     encoder_output_shape=encoder_states.shape
 
-            controlnet_image=(eg3doutput['image'].detach()).to(dtype=weight_dtype)
-            down_block_res_samples, mid_block_res_sample = controlnet(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=encoder_states,
-                controlnet_cond=controlnet_image,
-                return_dict=False,
-            )     
+            if args.controlnet:
+                controlnet_image=(eg3doutput['image'].detach()).to(dtype=weight_dtype)
+                controlnet_image=torch.zeros_like(controlnet_image)
 
-            unet_output=unet(noisy_latents,
-                             timesteps,
-                             encoder_hidden_states=encoder_states,
-                             down_block_additional_residuals=[
-                                sample.to(dtype=weight_dtype) for sample in down_block_res_samples
-                             ],
-                             mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
-            )
+                down_block_res_samples, mid_block_res_sample = controlnet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=encoder_states,
+                        controlnet_cond=controlnet_image,
+                        return_dict=False,
+                    )     
+
+                unet_output=unet(noisy_latents,
+                                timesteps,
+                                encoder_hidden_states=encoder_states,
+                                down_block_additional_residuals=[
+                                    sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+                                ],
+                                mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
+                )
+            else:
+                unet_output=unet(noisy_latents,
+                                timesteps,
+                                encoder_hidden_states=encoder_states,
+                )
         
             if noise_scheduler.config.prediction_type == "epsilon":
                 target = noise

@@ -13,3 +13,5 @@ control3diff*
 dataset_preprocessing/ffhq/ffhq-dataset-v2.json.tmp.25c2754cb5c940f1a9bfe5a420482a85
 eg3d/~
 eg3d/image_variation_finetune
+
+eg3d/outputs
