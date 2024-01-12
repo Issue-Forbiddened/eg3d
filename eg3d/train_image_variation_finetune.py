@@ -541,7 +541,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
-        default=None,
+        default=3,
         help=("Max number of checkpoints to store."),
     )
     parser.add_argument(
@@ -573,7 +573,7 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        '--network_pkl', help='Network pickle filename', required=False,default='/home1/jo_891/data1/eg3d/ffhqrebalanced512-128.pkl'
+        '--network_pkl', help='Network pickle filename', required=False,default='/root/eg3d/eg3d/pretrained_models/ffhqrebalanced512-128.pkl'
     )
     parser.add_argument(
         '--truncation_psi', type=float, help='Truncation psi', default=0.7
@@ -1419,48 +1419,50 @@ def generate_images():
                 break
 
     if not os.path.exists(os.path.join(args.output_dir,'stats_dict.json')):
-        print(f'device is {device}, is_main_process is {accelerator.is_main_process}')
-        if accelerator.is_main_process:
-            total_sample=100000
-            minibatch=64
-            total_batch=total_sample//minibatch
-            sample_count=0
-            mean = torch.zeros([96, 64, 64], device=device,dtype=torch.float64)
-            M2 = torch.zeros([96, 64, 64], device=device,dtype=torch.float64)
-            with torch.no_grad():
-                for idx in tqdm(range(total_batch),desc='getting scale:'):
-                    z_generator=torch.randn(minibatch, G.z_dim, device=device)
-                    cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
-                    cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
-                    cam2world_pose=UniformCameraPoseSampler.sample(np.pi/2, np.pi/2 , horizontal_stddev=np.pi/4,vertical_stddev=np.pi/4,
-                        lookat_position=torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device), 
-                        radius=G.rendering_kwargs.get('avg_camera_radius', 2.7), device=device,batch_size=minibatch)
-                    conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device,batch_size=minibatch)
-                    camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
-                    conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
+        if os.path.exists('./outputs/image_variation_finetune/stats_dict.json') and False:
+            shutil.copy('./outputs/image_variation_finetune/stats_dict.json',os.path.join(args.output_dir,'stats_dict.json'))
+        else:
+            if accelerator.is_main_process:
+                total_sample=200000
+                minibatch=64
+                total_batch=total_sample//minibatch
+                sample_count=0
+                mean = torch.zeros([96, 64, 64], device=device,dtype=torch.float64)
+                M2 = torch.zeros([96, 64, 64], device=device,dtype=torch.float64)
+                with torch.no_grad():
+                    for idx in tqdm(range(total_batch),desc='getting scale:'):
+                        z_generator=torch.randn(minibatch, G.z_dim, device=device)
+                        cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
+                        cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
+                        cam2world_pose=UniformCameraPoseSampler.sample(np.pi/2, np.pi/2 , horizontal_stddev=np.pi/4,vertical_stddev=np.pi/4,
+                            lookat_position=torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device), 
+                            radius=G.rendering_kwargs.get('avg_camera_radius', 2.7), device=device,batch_size=minibatch)
+                        conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device,batch_size=minibatch)
+                        camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
+                        conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9).repeat(cam2world_pose.shape[0],1)], 1)
 
-                    ws = G.mapping(z_generator, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-                    planes=G.get_planes(ws) # (batch_size,96,256,256)
-                    planes= planes.to(torch.float64)
-                    # interpolate to 64x64
-                    planes = F.interpolate(planes, size=(64, 64), mode='bilinear', align_corners=False)
+                        ws = G.mapping(z_generator, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
+                        planes=G.get_planes(ws) # (batch_size,96,256,256)
+                        planes= planes.to(torch.float64)
+                        # interpolate to 64x64
+                        planes = F.interpolate(planes, size=(64, 64), mode='bilinear', align_corners=False)
 
 
-                    if not torch.isnan(planes).any():
-                        sample_count += minibatch
-                        delta = planes - mean
-                        mean += delta.sum(dim=0) / sample_count
-                        M2 += (1/sample_count)*((sample_count-minibatch)/(sample_count)*((delta**2).sum(dim=0))-M2)
-            # 计算最终的方差 
-            variance = M2 
-            # 计算标准差
-            std = torch.sqrt(variance) # (96,256,256)
-            std = std.cpu().numpy().tolist()
-            mean_list = mean.cpu().numpy().tolist()  # (96,256,256)
-            stats_dict = {'mean': mean_list, 'std': std}
-            with open(os.path.join(args.output_dir,'stats_dict.json'),'w') as f:
-                json.dump(stats_dict,f)
-                
+                        if not torch.isnan(planes).any():
+                            sample_count += minibatch
+                            delta = planes - mean
+                            mean += delta.sum(dim=0) / sample_count
+                            M2 += (1/sample_count)*((sample_count-minibatch)/(sample_count)*((delta**2).sum(dim=0))-M2)
+                # 计算最终的方差 
+                variance = M2 
+                # 计算标准差
+                std = torch.sqrt(variance) # (96,256,256)
+                std = std.cpu().numpy().tolist()
+                mean_list = mean.cpu().numpy().tolist()  # (96,256,256)
+                stats_dict = {'mean': mean_list, 'std': std}
+                with open(os.path.join(args.output_dir,'stats_dict.json'),'w') as f:
+                    json.dump(stats_dict,f)
+                    
     accelerator.wait_for_everyone()
     # read stats_dict
     with open(os.path.join(args.output_dir,'stats_dict.json'),'r') as f:
@@ -2136,6 +2138,6 @@ if __name__ == "__main__":
 
 # accelerate launch --mixed_precision=fp16 train_control3diff_clip.py --train_batch_size=4 --log_step_interval=5000 --checkpointing_steps=7500 --use_ema --resume_from_checkpoint=latest --output=control3diff_trained_clip_retrain --scaled --verify_text='Close-up of a young male with bright green eyes, short blond hair, and a clean-shaven face, showing a neutral expression' --additional_sample=16
 
-# accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=image_variation_finetune --wandb_offline  --prediction_type=epsilon --backbone --freeze_attentions
+# accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output_dir=outputs/image_variation_finetune_freeze_attentions --wandb_offline  --prediction_type=epsilon --backbone --freeze_attentions
     
 # accelerate launch --mixed_precision=fp16 train_image_variation_finetune.py --train_batch_size=2 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=image_variation_finetune_test --wandb_offline  --prediction_type=epsilon

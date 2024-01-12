@@ -15,3 +15,6 @@ eg3d/~
 eg3d/image_variation_finetune
 
 eg3d/outputs
+
+eg3d/dataset_*
+eg3d/try_*

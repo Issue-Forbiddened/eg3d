@@ -22,7 +22,7 @@ import torch
 from tqdm import tqdm
 import mrcfile
 
-import pdb
+
 import legacy
 from camera_utils import LookAtPoseSampler, FOV_to_intrinsics
 from torch_utils import misc
@@ -133,7 +133,7 @@ def generate_images(
 
     \b
     # Generate an image using pre-trained FFHQ model.
-    python gen_triplane.py --outdir=outputs/triplane_outputs --trunc=0.7 --seeds=0-5 --shapes=False --network=/home/junyi/eg3d/eg3d/pretrained_models/ffhqrebalanced512-128.pkl --reload_modules=True
+    CUDA_VISIBLE_DEVICES=1 python gen_datasets.py --outdir=./dataset_v1_test --trunc=0.7 --seeds=5000-5099 --network=/root/eg3d/eg3d/pretrained_models/ffhqrebalanced512-128.pkl --reload_modules=True   
     """
 
     print('Loading networks from "%s"...' % network_pkl)
@@ -150,163 +150,57 @@ def generate_images(
         G_new.rendering_kwargs = G.rendering_kwargs
         G = G_new
 
-        
-
     os.makedirs(outdir, exist_ok=True)
+    os.makedirs(os.path.join(outdir, 'triplane'), exist_ok=True)
+    os.makedirs(os.path.join(outdir, 'image'), exist_ok=True)
+
+    outdir_triplane=os.path.join(outdir, 'triplane')
+    outdir_image=os.path.join(outdir, 'image')
 
     cam2world_pose = LookAtPoseSampler.sample(3.14/2, 3.14/2, torch.tensor([0, 0, 0.2], device=device), radius=2.7, device=device)
     intrinsics = FOV_to_intrinsics(fov_deg, device=device)
 
-    
-    import json
-    import numpy as np
-    # import h5py
-    # with open('/home/junyi/eg3d/eg3d/outputs/image_variation_finetune/stats_dict.json','r') as f:
-    #     stats_dict=json.load(f)
-    # mean_load=torch.tensor(stats_dict['mean'],device=device,dtype=torch.float32).reshape(1,96,64,64)
-    # std_load=torch.tensor(stats_dict['std'],device=device,dtype=torch.float32).reshape(1,96,64,64)
-
-    # # interpolate mean and std to 256x256
-    # mean_load = torch.nn.functional.interpolate(mean_load, size=(256,256), mode='bilinear', align_corners=False)
-    # std_load = torch.nn.functional.interpolate(std_load, size=(256,256), mode='bilinear', align_corners=False)
-
-    
-    # normalize_fn=lambda x: (x-mean_load)/(std_load)
-    # inv_normalize_fn=lambda x: x*std_load+mean_load
+    num_image_per_identity = 3
+    angle_p_max=0.3
+    angle_p_min=-0.3
+    angle_y_max=0.4
+    angle_y_min=-0.4
+    import tqdm
+    bar=tqdm.tqdm(total=len(seeds)*num_image_per_identity)
     # Generate images.
     for seed_idx, seed in enumerate(seeds):
         print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
         z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
 
-        imgs = []
-        angle_p = -0.2
-        for angle_y, angle_p in [(.4, angle_p), (0, angle_p), (-.4, angle_p)]:
-        # for angle_y, angle_p in [(0.,angle_p)]:
+        for image_idx in range(num_image_per_identity):
+            if image_idx==0:
+                angle_p=-0.2
+                angle_y=0.
+            else:
+                angle_y=np.random.uniform(angle_y_min, angle_y_max)
+                angle_p=np.random.uniform(angle_p_min, angle_p_max)
             cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
             cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
             cam2world_pose = LookAtPoseSampler.sample(np.pi/2 + angle_y, np.pi/2 + angle_p, cam_pivot, radius=cam_radius, device=device)
             conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device)
-            # conditioning_cam2world_pose=cam2world_pose
             camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
             conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
 
             ws = G.mapping(z, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-            planes=G.get_planes(ws)  # (1,96,256,256)
 
-            planes=planes.to(torch.float16)
-
-            
-            
-            # # save as hdf5
-            # with h5py.File(f'{outdir}/seed{seed:04d}_planes.h5', 'w') as f:
-            #     # 将数据存储到文件中
-            #     f.create_dataset('planes', data=planes[0].cpu().numpy())
-
-            # # read from hdf5
-            # with h5py.File(f'{outdir}/seed{seed:04d}_planes.h5', 'r') as f:
-            #     # 读取数据集
-            #     planes = f['planes'][:]
-            
-            # # save as npz
-            # np.savez(f'{outdir}/seed{seed:04d}_planes.npz',planes=planes[0].cpu().numpy())     
-
-            # # load from npz
-            # planes=np.load(f'{outdir}/seed{seed:04d}_planes.npz')['planes']
-
-            # planes=torch.from_numpy(planes).to(dtype=torch.float16,device=device)[None,...]
-
-            # # save as torch
-            # torch.save(planes[0].cpu(), f'{outdir}/seed{seed:04d}_planes.pt')
-
-            planes=planes.to(torch.float32)
-
-            # original_planes=planes.clone()
-
-            # # use bilinear interpolation to downsample planes to 64x64
-            # planes = torch.nn.functional.interpolate(planes, size=(4,4), mode='bilinear', align_corners=False)
-            # # use bilinear interpolation to upsample planes to 256x256
-            # planes = torch.nn.functional.interpolate(planes, size=(256,256), mode='bilinear', align_corners=False)
-
-            # original_planes[:,32:96]=planes[:,32:96]
-            # planes=original_planes
+            planes=G.get_planes(ws)
+            if image_idx==0:
+                torch.save(planes[0].to(torch.float16), os.path.join(outdir_triplane, f'id_{seed_idx}_planes.pt'))
 
             img = G.render_from_planes(camera_params,planes)['image']
 
             img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-            imgs.append(img)
 
-        Image=PIL.Image
-        # 创建一个大的空白图像
-        big_image = Image.new('L', (32 * 256, 3 * 256))
-        planes=planes[0].cpu()
+            PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(os.path.join(outdir_image, f'id_{seed_idx}_img_{image_idx}.png'))
 
-        for i in range(planes.size(0)):
-            # 单独对每个切片进行归一化
-            slice = planes[i]
-            slice_min = slice.min()
-            slice_max = slice.max()
-            slice = (255 * (slice - slice_min) / (slice_max - slice_min)).byte()
+            bar.update(1)
 
-            # 转换为 PIL 图像
-            img = Image.fromarray(slice.numpy(), mode='L')
-
-            # 计算在大图像中的位置
-            x = (i % 32) * 256  # 横向位置
-            y = (i // 32) * 256  # 纵向位置
-
-            # 将小图像粘贴到大图像上
-            big_image.paste(img, (x, y))
-
-        # save planes
-        # big_image.save(f'{outdir}/seed{seed:04d}_planes.png')
-
-        img = torch.cat(imgs, dim=2)
-
-        PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
-
-        # # save planes
-        # planes=PIL.Image.fromarray(planes.cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_planes.png')
-
-        if shapes:
-            # extract a shape.mrc with marching cubes. You can view the .mrc file using ChimeraX from UCSF.
-            max_batch=1000000
-
-            samples, voxel_origin, voxel_size = create_samples(N=shape_res, voxel_origin=[0, 0, 0], cube_length=G.rendering_kwargs['box_warp'] * 1)#.reshape(1, -1, 3)
-            samples = samples.to(z.device)
-            sigmas = torch.zeros((samples.shape[0], samples.shape[1], 1), device=z.device)
-            transformed_ray_directions_expanded = torch.zeros((samples.shape[0], max_batch, 3), device=z.device)
-            transformed_ray_directions_expanded[..., -1] = -1
-
-            head = 0
-            with tqdm(total = samples.shape[1]) as pbar:
-                with torch.no_grad():
-                    while head < samples.shape[1]:
-                        torch.manual_seed(0)
-                        sigma = G.sample(samples[:, head:head+max_batch], transformed_ray_directions_expanded[:, :samples.shape[1]-head], z, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, noise_mode='const')['sigma']
-                        sigmas[:, head:head+max_batch] = sigma
-                        head += max_batch
-                        pbar.update(max_batch)
-
-            sigmas = sigmas.reshape((shape_res, shape_res, shape_res)).cpu().numpy()
-            sigmas = np.flip(sigmas, 0)
-
-            # Trim the border of the extracted cube
-            pad = int(30 * shape_res / 256)
-            pad_value = -1000
-            sigmas[:pad] = pad_value
-            sigmas[-pad:] = pad_value
-            sigmas[:, :pad] = pad_value
-            sigmas[:, -pad:] = pad_value
-            sigmas[:, :, :pad] = pad_value
-            sigmas[:, :, -pad:] = pad_value
-
-            if shape_format == '.ply':
-                from shape_utils import convert_sdf_samples_to_ply
-                convert_sdf_samples_to_ply(np.transpose(sigmas, (2, 1, 0)), [0, 0, 0], 1, os.path.join(outdir, f'seed{seed:04d}.ply'), level=10)
-            elif shape_format == '.mrc': # output mrc
-                with mrcfile.new_mmap(os.path.join(outdir, f'seed{seed:04d}.mrc'), overwrite=True, shape=sigmas.shape, mrc_mode=2) as mrc:
-                    mrc.data[:] = sigmas
-
+        
 
 #----------------------------------------------------------------------------
 
