@@ -27,7 +27,6 @@ import legacy
 from camera_utils import LookAtPoseSampler, FOV_to_intrinsics, UniformCameraPoseSampler
 from torch_utils import misc
 from training.triplane import TriPlaneGenerator,TriPlaneGenerator_Modified
-from training.dual_discriminator import DualDiscriminator_Mine
 
 import diffusers
 import torch.nn as nn
@@ -41,7 +40,8 @@ from accelerate import Accelerator
 import logging
 from diffusers.training_utils import EMAModel
 from accelerate.logging import get_logger
-from diffusers import UNet2DConditionModel_downsample
+# from diffusers import UNet2DConditionModel_Modified
+from unet_modified import UNet2DConditionModel_Modified
 import shutil
 import argparse
 from accelerate.utils import ProjectConfiguration
@@ -634,11 +634,11 @@ def forward_process(latent2img_fn,timesteps,noise_scheduler,latents,noise):
 
 def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder_states,
                     camera_params,G,latent_guidance=None,lpips_fn=None,eg3doutput=None,
-                    inv_normalize_fn=None,reverse_type='normal',return_pred=False,return_latents=False,i_end=50):
+                    inv_normalize_fn=None,reverse_type='normal',return_pred=False,return_latents=False,i_end=None):
+    if i_end is None:
+        i_end=len(timesteps)
     reverse_process_list=[]
     latents=latents.detach().clone()
-    if latent2img_fn is None:
-        latent2img_fn=lambda x:x
     reverse_process_list.append(latent2img_fn(latents))
 
     # if reverse_type=='cfg':
@@ -705,10 +705,14 @@ def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder
             latents=noise_scheduler.step(pred, t, latents, return_dict=False)[0]
 
         elif reverse_type=='cfg':
-            pred_cfg=unet(latents,t,encoder_states,return_dict=False)[0]
-            pred_non_con=unet(latents,t,encoder_states_none,return_dict=False)[0]
-            pred_cfg=pred_cfg+2.0*(pred_cfg-pred_non_con)
-            latents=noise_scheduler.step(pred_cfg, t, latents, return_dict=False)[0]
+            if i<i_end-5:
+                pred_cfg=unet(latents,t,encoder_states,return_dict=False)[0]
+                pred_non_con=unet(latents,t,encoder_states_none,return_dict=False)[0]
+                pred_cfg=pred_cfg+2.0*(pred_cfg-pred_non_con)
+                latents=noise_scheduler.step(pred_cfg, t, latents, return_dict=False)[0]
+            else:
+                pred=unet(latents,t,encoder_states,return_dict=False)[0] 
+                latents=noise_scheduler.step(pred, t, latents, return_dict=False)[0]
             pred=pred_cfg
 
         # vgg guidance
@@ -857,7 +861,7 @@ def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder
             latents=noise_scheduler.step(pred_guidance_interpolate, t, latents, return_dict=False)[0]
             pred=pred_guidance_interpolate
 
-        if i%5==0 or i==len(timesteps)-1:
+        if i%10==0 or i==len(timesteps)-1:
             if return_pred:
                 reverse_process_list.append(latent2img_fn(pred))
             reverse_process_list.append(latent2img_fn(latents))
@@ -1110,16 +1114,10 @@ def generate_images():
         'use_linear_projection':True
                                           }
     
-    unet=UNet2DConditionModel_downsample(**unet_config)
+    unet=UNet2DConditionModel_Modified(**unet_config)
 
     if args.use_ema:
-        ema_unet = EMAModel(unet.parameters(), model_cls=UNet2DConditionModel_downsample, model_config=unet.config)
-
-    encoder_config={'in_channels':3,
-                    'down_block_types':("ResnetDownsampleBlock2D","ResnetDownsampleBlock2D",
-                                        "AttnDownBlock2D","AttnDownBlock2D","AttnDownBlock2D","AttnDownBlock2D"),
-                    'block_out_channels':(32, 64, 64, 128, 256, 512),
-                                }
+        ema_unet = EMAModel(unet.parameters(), model_cls=UNet2DConditionModel_Modified,»
 
     encoder=Encoder(**encoder_config)
 
@@ -1149,7 +1147,7 @@ def generate_images():
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel_downsample)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel_Modified)
                 ema_unet.load_state_dict(load_model.state_dict())
                 ema_unet.to(accelerator.device)
                 load_model = EMAModel.from_pretrained(os.path.join(input_dir, "encoder_ema"), Encoder)
@@ -1165,10 +1163,8 @@ def generate_images():
                     # load diffusers style into model
                     if isinstance(model, Encoder):
                         load_model = Encoder.from_pretrained(input_dir, subfolder="encoder")
-                    elif isinstance(model, UNet2DConditionModel_downsample):
-                        load_model = UNet2DConditionModel_downsample.from_pretrained(input_dir, subfolder="unet")
-                    elif isinstance(model, DualDiscriminator_Mine):
-                        load_model = DualDiscriminator_Mine.from_pretrained(input_dir, subfolder="discriminator")
+                elif isinstance(model, UNet2DConditionModel_Modified):
+                    load_model = UNet2DConditionModel_Modified.from_pretrained(input_dir, subfolder="unet")
                     model.register_to_config(**load_model.config)
 
                     model.load_state_dict(load_model.state_dict())

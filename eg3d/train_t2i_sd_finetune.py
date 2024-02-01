@@ -624,6 +624,9 @@ def parse_args():
     # dataset_path str
     parser.add_argument("--dataset_path", type=str, default='', help="The dataset path.")
 
+    # freeze_attentions bool, default false
+    parser.add_argument("--normalize", action="store_true", help="Whether to normalize clip feature.")
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -1620,6 +1623,8 @@ def generate_images():
             adv_update_D_this_step=global_step%adv_step_interval==0 
             G_step_warmup+=1
             encoder_states=batch['caption_feature'].detach()
+            if args.normalize:
+                encoder_states=encoder_states/torch.norm(encoder_states,dim=-1,keepdim=True)
             planes=batch['triplane']
             with torch.no_grad():
                 z_generator=torch.randn(args.train_batch_size, G.z_dim, device=device)
@@ -2241,4 +2246,4 @@ if __name__ == "__main__":
     
 # accelerate launch --mixed_precision=fp16 train_t2i_sd_finetune.py --train_batch_size=2 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=outputs/t2i_finetune_test --wandb_offline  --prediction_type=epsilon --dataset_path dataset_v1
     
-# accelerate launch --mixed_precision=fp16 train_t2i_sd_finetune.py --train_batch_size=2 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=outputs/t2i_finetune_test --wandb_offline  --prediction_type=epsilon --dataset_path dataset_v1 --freeze_attentions
+# accelerate launch --mixed_precision=fp16 train_t2i_sd_finetune.py --train_batch_size=2 --log_step_interval=2500 --checkpointing_steps=5000 --resume_from_checkpoint=latest --output=outputs/t2i_finetune_test_norm --wandb_offline  --prediction_type=epsilon --dataset_path dataset_v1 
