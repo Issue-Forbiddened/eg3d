@@ -3,6 +3,7 @@ eg3d/training-runs*
 
 *.png
 *.pkl
+*.pth
 
 control3diff*
 *.zip

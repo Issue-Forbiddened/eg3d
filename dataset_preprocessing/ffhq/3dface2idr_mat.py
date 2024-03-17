@@ -45,8 +45,8 @@ for src_filename in npys:
     pose[:3, :3] = R
 
     c *= 0.27 # normalize camera radius
-    c[1] += 0.006 # additional offset used in submission
-    c[2] += 0.161 # additional offset used in submission
+    # c[1] += 0.006 # additional offset used in submission
+    # c[2] += 0.161 # additional offset used in submission
     pose[0,3] = c[0]
     pose[1,3] = c[1]
     pose[2,3] = c[2]

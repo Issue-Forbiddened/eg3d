@@ -561,7 +561,7 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        '--network_pkl', help='Network pickle filename', required=False,default='/home1/jo_891/data1/eg3d/ffhq512-128.pkl'
+        '--network_pkl', help='Network pickle filename', required=False,default='/root/eg3d/eg3d/pretrained_models/ffhqrebalanced512-128.pkl'
     )
     parser.add_argument(
         '--truncation_psi', type=float, help='Truncation psi', default=0.7
@@ -634,11 +634,11 @@ def forward_process(latent2img_fn,timesteps,noise_scheduler,latents,noise):
 
 def reverse_process(latent2img_fn,timesteps,noise_scheduler,latents,unet,encoder_states,
                     camera_params,G,latent_guidance=None,lpips_fn=None,eg3doutput=None,
-                    inv_normalize_fn=None,reverse_type='normal',return_pred=False,return_latents=False,i_end=None):
-    if i_end is None:
-        i_end=len(timesteps)
+                    inv_normalize_fn=None,reverse_type='normal',return_pred=False,return_latents=False,i_end=50):
     reverse_process_list=[]
     latents=latents.detach().clone()
+    if latent2img_fn is None:
+        latent2img_fn=lambda x:x
     reverse_process_list.append(latent2img_fn(latents))
 
     # if reverse_type=='cfg':
@@ -994,7 +994,7 @@ def inversion_G_data_with_render(sample_num, device, truncation_psi, truncation_
 
 
         reverse_process_list,denoised_ddim=reverse_process(latent2img_fn,timesteps,noise_scheduler,noise,unet_val,encoder_states,camera_params,
-                                            G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type=reverse_type,return_pred=True,return_latents=True,i_end=50)
+                                            G,latent_guidance,lpips_fn,eg3doutput,inv_normalize_fn,reverse_type=reverse_type,return_pred=True,return_latents=True,i_end=30)
         
         if stride_for_quantitative is not None:
             original_multiview=multiview_render(normalize_fn(planes),camera_params_val_list[::stride_for_quantitative],latent2img_fn_nouint8) 
@@ -1110,15 +1110,20 @@ def generate_images():
         'cross_attention_dim':(64, 64, 64, 128, 256, 512),
         'up_block_types':("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D","ResnetUpsampleBlock2D","ResnetUpsampleBlock2D"),
         'attention_head_dim':4,
-        'down_sampling_ratio':1,
         'use_linear_projection':True
                                           }
     
     unet=UNet2DConditionModel_Modified(**unet_config)
 
     if args.use_ema:
-        ema_unet = EMAModel(unet.parameters(), model_cls=UNet2DConditionModel_Modified,»
+        ema_unet = EMAModel(unet.parameters(), model_cls=UNet2DConditionModel_Modified, model_config=unet.config)
 
+
+    encoder_config={'in_channels':3,
+                    'down_block_types':("ResnetDownsampleBlock2D","ResnetDownsampleBlock2D",
+                                        "AttnDownBlock2D","AttnDownBlock2D","AttnDownBlock2D","AttnDownBlock2D"),
+                    'block_out_channels':(32, 64, 64, 128, 256, 512),
+                                }
     encoder=Encoder(**encoder_config)
 
     if args.use_ema:
@@ -1163,12 +1168,12 @@ def generate_images():
                     # load diffusers style into model
                     if isinstance(model, Encoder):
                         load_model = Encoder.from_pretrained(input_dir, subfolder="encoder")
-                elif isinstance(model, UNet2DConditionModel_Modified):
-                    load_model = UNet2DConditionModel_Modified.from_pretrained(input_dir, subfolder="unet")
-                    model.register_to_config(**load_model.config)
+                    elif isinstance(model, UNet2DConditionModel_Modified):
+                        load_model = UNet2DConditionModel_Modified.from_pretrained(input_dir, subfolder="unet")
+                        model.register_to_config(**load_model.config)
 
-                    model.load_state_dict(load_model.state_dict())
-                    del load_model
+                        model.load_state_dict(load_model.state_dict())
+                        del load_model
                 except OSError:
                     continue
 
@@ -1215,38 +1220,6 @@ def generate_images():
         'trained_betas':None,
     }
 
-    if False:
-        # 验证noise scaling策略是否正确
-        noise_scheduler_dummy=diffusers.schedulers.DDPMScheduler(**noise_scheduler_config_dummpy)
-        snr=1/((noise_scheduler_dummy.alphas_cumprod)**(-1)-1)
-        logsnr=torch.log(snr)
-        logsnr_shifted=logsnr+2*np.log(64/256)
-        snr_shifted=torch.exp(logsnr_shifted)
-        alphas_cumprod_shifted=1/(1+(1/snr_shifted))
-        betas=torch.stack([1-alphas_cumprod_shifted[i+1]/alphas_cumprod_shifted[i] for i in range(len(alphas_cumprod_shifted)-1)]+[0.999*torch.ones_like(alphas_cumprod_shifted[-1])])
-        betas=betas.cpu().numpy().tolist()
-        noise_scheduler_config_dummpy['trained_betas']=betas
-        noise_scheduler=diffusers.schedulers.DDPMScheduler(**noise_scheduler_config_dummpy)
-        t=torch.linspace(0,1-0.001,1000)
-        snr_calculated=torch.exp(-2*torch.log(torch.tan(t*np.pi/2))+2*np.log(64/256))
-        alphas_cumprod_calculated=1/(1+snr_calculated)
-        import matplotlib.pyplot as plt
-        t=torch.linspace(0,1,1000)
-        plt.plot(t.cpu().numpy(),(noise_scheduler_dummy.alphas_cumprod**0.5).cpu().numpy(),label='alphas_cumprod_sqrt_original')
-        plt.plot(t.cpu().numpy(),(alphas_cumprod_shifted**0.5).cpu().numpy(),label='alphas_cumprod_sqrt_shifted')
-        plt.plot(t.cpu().numpy(),(alphas_cumprod_calculated**0.5).cpu().numpy(),label='alphas_cumprod_sqrt_calculated')
-        plt.plot(t.cpu().numpy(),(noise_scheduler.alphas_cumprod**0.5).cpu().numpy(),label='alphas_cumprod_sqrt_shifted_scheduler')
-        plt.plot(t.cpu().numpy(),((1-noise_scheduler_dummy.alphas_cumprod)**0.5).cpu().numpy(),label='betas_sqrt')
-        plt.plot(t.cpu().numpy(),((1-alphas_cumprod_shifted)**0.5).cpu().numpy(),label='betas_sqrt_shifted')
-        plt.plot(t.cpu().numpy(),((1-alphas_cumprod_calculated)**0.5).cpu().numpy(),label='betas_sqrt_calculated')
-        plt.plot(t.cpu().numpy(),((1-noise_scheduler.alphas_cumprod)**0.5).cpu().numpy(),label='betas_sqrt_shifted_scheduler')
-        plt.legend()
-        plt.savefig('schedule.png')
-        # origin=torch.stack([1-noise_scheduler_dummy.alphas_cumprod[0]]+[1-noise_scheduler_dummy.alphas_cumprod[i+1]/noise_scheduler_dummy.alphas_cumprod[i] for i in range(len(alphas_cumprod_shifted)-1)])
-        # torch.stack([1-noise_scheduler_dummy.alphas_cumprod[i+1]/noise_scheduler_dummy.alphas_cumprod[i] 
-        #     for i in range(len(alphas_cumprod_shifted)-1)]+[torch.ones_like(alphas_cumprod_shifted[-1])])
-        
-        # snr_dummy=alphas_cumprod
 
     noise_scheduler_dummy=diffusers.schedulers.DDIMScheduler(**noise_scheduler_config_dummpy)
     snr=1/((noise_scheduler_dummy.alphas_cumprod)**(-1)-1)
@@ -1511,7 +1484,7 @@ def generate_images():
     inverse_G_data_ret_dict=inversion_G_data(sample_num=sample_for_visualize_per_frame, device=device, 
                                 truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff,
                                 args=args, normalize_fn=normalize_fn, encoder=encoder_val, unet_val=unet_val, latent_guidance=latent_guidance,
-                                lpips_fn=lpips_fn, inv_normalize_fn=inv_normalize_fn, reverse_type='normal',
+                                lpips_fn=lpips_fn, inv_normalize_fn=inv_normalize_fn, reverse_type='cfg',
                                 noise_scheduler=noise_scheduler, G=G, latent2img_fn=None, intrinsics=intrinsics)
 
     original_multiview_visualize=multiview_render(inverse_G_data_ret_dict['original_latents'],\
@@ -1546,6 +1519,17 @@ def generate_images():
     # Release the VideoWriter object
     out.release()
 
+
+    # File paths
+    avi_file_path = os.path.join(args.output_dir,
+                                        'inversion_G_data_{}.avi'.format(str(global_step)))
+    mp4_file_path = avi_file_path.replace('.avi', '.mp4')
+
+    # Convert AVI to MP4
+    from moviepy.editor import VideoFileClip
+    video_clip = VideoFileClip(avi_file_path)
+    video_clip.write_videofile(mp4_file_path, codec='libx264')
+
     # if accelerator.is_main_process: 
     #     # write to args.output_dir with name 'metrics.json'
     #     metrics_dict = inverse_G_data_metric_ret_dict
@@ -1565,16 +1549,16 @@ if __name__ == "__main__":
 
 #----------------------------------------------------------------------------
 # accelerate launch --mixed_precision=fp16 test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=latest
-# accelerate launch --mixed_precision=fp16 test_control3diff.py --train_batch_size=4 --log_step_interval=5000 --checkpointing_steps=7500 --use_ema --resume_from_checkpoint=latest --output_dir=control3diff_trained_large_noise
+# accelerate launch --mixed_precision=fp16 test_control3diff.py --train_batch_size=4 --log_step_interval=5000 --checkpointing_steps=7500 --use_ema --resume_from_checkpoint=latest --output_dir=outputs/control3diff_trained_large_noise
 
-# --output_dir=control3diff_trained_large_noise_mv_adv
+# --output_dir=outputs/control3diff_trained_large_noise_mv_adv
 
-# CUDA_VISIBLE_DEVICES=0 python test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=latest  --output_dir=control3diff_trained_large_noise_mv_adv --wandb_offline
+# CUDA_VISIBLE_DEVICES=0 python test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=latest  --output_dir=outputs/control3diff_trained_large_noise_mv_adv --wandb_offline
 # CUDA_VISIBLE_DEVICES=1
 
-# CUDA_VISIBLE_DEVICES=0 python test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=latest  --output_dir=control3diff_trained_unconditional --wandb_offline --scaled
-# CUDA_VISIBLE_DEVICES=1 python test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=/home1/jo_891/data1/eg3d/eg3d/control3diff_trained_unconditional/checkpoint-400000  --output_dir=control3diff_trained_unconditional --wandb_offline --scaled
+# CUDA_VISIBLE_DEVICES=0 python test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=latest  --output_dir=outputs/control3diff_trained_unconditional --wandb_offline --scaled
+# CUDA_VISIBLE_DEVICES=1 python test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=/home1/jo_891/data1/eg3d/eg3d/control3diff_trained_unconditional/checkpoint-400000  --output_dir=outputs/control3diff_trained_unconditional --wandb_offline --scaled
 
 
 
-# CUDA_VISIBLE_DEVICES=0 python test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=latest  --output_dir=control3diff_trained_large_noise --wandb_offline
+# CUDA_VISIBLE_DEVICES=0 python test_control3diff.py --train_batch_size=4 --log_step_interval=2500 --checkpointing_steps=5000 --use_ema --resume_from_checkpoint=latest  --output_dir=outputs/control3diff_trained_large_noise --wandb_offline

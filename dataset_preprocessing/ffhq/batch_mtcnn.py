@@ -31,6 +31,8 @@ if not os.path.exists(out_detection):
 imgs = sorted([x for x in os.listdir(in_root) if x.endswith(".jpg") or x.endswith(".png")])
 random.shuffle(imgs)
 for img in imgs:
+    if 'mirror' in img:
+        continue
     src = os.path.join(in_root, img)
     print(src)
     if img.endswith(".jpg"):
@@ -69,3 +71,7 @@ for img in imgs:
                 outLand.write(str(float(keypoints['mouth_right'][0])) + " " + str(float(keypoints['mouth_right'][1])) + "\n")
                 outLand.close()
                 print(result)   
+            else:
+                print(f"{src}: face not detected")
+                # remove the file
+                os.remove(src)
