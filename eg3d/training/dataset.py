@@ -18,7 +18,7 @@ import json
 import torch
 import dnnlib
 from pytorch3d import transforms
-
+import bisect
 try:
     import pyspng
 except ImportError:
@@ -263,3 +263,55 @@ class ImageFolderDataset(Dataset):
         return labels
 
 #----------------------------------------------------------------------------
+class CombinedImageDataset(Dataset):
+    def __init__(self,
+        datasets_info,         # List of tuples: [(path1, weight1), (path2, weight2), ...]
+        resolution = None,     # Ensure specific resolution, None = highest available.
+        **super_kwargs         # Additional arguments for the Dataset base class.
+    ):
+        self._datasets = []
+        self._weights = []
+        self._total_weight = 0
+        self._image_fnames = []
+        self._dataset_offsets = [0]  # Starting index of each dataset in the combined list
+
+        # Initialize datasets and calculate total weight
+        for path, weight in datasets_info:
+            if type(weight)==float:
+                weight=int(weight)
+                print(f"Weight is float, converting to int: {weight}")
+            dataset = ImageFolderDataset(path=path, resolution=resolution)
+            self._datasets.append(dataset)
+            self._weights.append(weight)
+            self._total_weight += weight
+            self._dataset_offsets.append(self._dataset_offsets[-1] + len(dataset) * weight)
+
+        # Adjust raw_shape to accommodate all images from all datasets
+        name = 'combined_' + '_'.join([ds.name for ds in self._datasets])
+        raw_shape = [self._dataset_offsets[-1]] + list(self._datasets[0].image_shape)
+        super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
+
+    def _load_raw_image(self, combined_idx):
+        # Find which dataset the index falls into
+        dataset_idx, local_idx = self._find_dataset_and_local_index(combined_idx)
+        return self._datasets[dataset_idx]._load_raw_image(local_idx)
+
+    def _load_raw_labels(self):
+        # Concatenate labels from all datasets, adjusting for weights
+        labels = []
+        for ds, weight in zip(self._datasets, self._weights):
+            ds_labels = ds._load_raw_labels()
+            if ds_labels is not None:
+                for _ in range(weight):
+                    labels.append(ds_labels)
+        if labels:
+            return np.concatenate(labels)
+        return None
+
+    def _find_dataset_and_local_index(self, combined_idx):
+        # Binary search to find which dataset the combined index falls into
+        dataset_idx = bisect.bisect_right(self._dataset_offsets, combined_idx) - 1
+        local_idx = combined_idx - self._dataset_offsets[dataset_idx]
+        # Adjust local index based on weight
+        local_idx = local_idx // self._weights[dataset_idx]
+        return dataset_idx, local_idx

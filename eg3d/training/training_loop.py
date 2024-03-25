@@ -222,15 +222,26 @@ def training_loop(
     loss = dnnlib.util.construct_class_by_name(device=device, G=G, D=D, augment_pipe=augment_pipe, **loss_kwargs) # subclass of training.loss.Loss
     phases = []
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
+        if name == 'G' and getattr(G_kwargs, 'lora_dim', 0) > 0:  # 检查是否为'G'且存在LoRA参数
+            lora_params = [param for param_name, param in module.named_parameters() if 'A' in param_name or 'B' in param_name or 'lora' in param_name]
+            print(f'using lora, {len(lora_params)} parameters')
+        else:
+            lora_params=[]
         if reg_interval is None:
-            opt = dnnlib.util.construct_class_by_name(params=module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            if len(lora_params):
+                opt= dnnlib.util.construct_class_by_name(params=lora_params, **opt_kwargs) # subclass of torch.optim.Optimizer
+            else:
+                opt = dnnlib.util.construct_class_by_name(params=module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
         else: # Lazy regularization.
             mb_ratio = reg_interval / (reg_interval + 1)
             opt_kwargs = dnnlib.EasyDict(opt_kwargs)
             opt_kwargs.lr = opt_kwargs.lr * mb_ratio
             opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
-            opt = dnnlib.util.construct_class_by_name(module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            if len(lora_params):
+                opt = dnnlib.util.construct_class_by_name(lora_params, **opt_kwargs)
+            else:
+                opt = dnnlib.util.construct_class_by_name(module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
             phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
     for phase in phases:
@@ -300,14 +311,25 @@ def training_loop(
 
             # Accumulate gradients.
             phase.opt.zero_grad(set_to_none=True)
-            phase.module.requires_grad_(True)
+            if getattr(G_kwargs,'lora_dim',0)>0 and 'G' in phase.name and False:
+                for param in lora_params:
+                    param.requires_grad_(True)
+            else:
+                phase.module.requires_grad_(True)
             for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
                 loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
-            phase.module.requires_grad_(False)
+            if getattr(G_kwargs,'lora_dim',0)>0 and 'G' in phase.name and False:
+                for param in lora_params:
+                    param.requires_grad_(False)
+            else:
+                phase.module.requires_grad_(False)
 
             # Update weights.
             with torch.autograd.profiler.record_function(phase.name + '_opt'):
-                params = [param for param in phase.module.parameters() if param.numel() > 0 and param.grad is not None]
+                if getattr(G_kwargs,'lora_dim',0)>0 and 'G' in phase.name and False :
+                    params = [param for param in lora_params if param.numel() > 0 and param.grad is not None]
+                else:
+                    params = [param for param in phase.module.parameters() if param.numel() > 0 and param.grad is not None]
                 if len(params) > 0:
                     flat = torch.cat([param.grad.flatten() for param in params])
                     if num_gpus > 1:
@@ -429,20 +451,20 @@ def training_loop(
                 with open(snapshot_pkl, 'wb') as f:
                     pickle.dump(snapshot_data, f)
 
-        # Evaluate metrics.
-        if (snapshot_data is not None) and (len(metrics) > 0):
-            if cur_tick>1000:
-                if rank == 0:
-                    print(run_dir)
-                    print('Evaluating metrics...')
-                for metric in metrics:
-                    if rank==0: print(metric)
-                    result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
-                        dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
-                    if rank == 0:
-                        metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
-                    stats_metrics.update(result_dict.results)
-                if rank==0:print('Done evaluating metrics')
+        # # Evaluate metrics.
+        # if (snapshot_data is not None) and (len(metrics) > 0):
+        #     if cur_tick>50:
+        #         if rank == 0:
+        #             print(run_dir)
+        #             print('Evaluating metrics...')
+        #         for metric in metrics:
+        #             if rank==0: print(metric)
+        #             result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
+        #                 dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
+        #             if rank == 0:
+        #                 metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
+        #             stats_metrics.update(result_dict.results)
+        #         if rank==0:print('Done evaluating metrics')
         del snapshot_data # conserve memory
 
         # Collect statistics.

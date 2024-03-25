@@ -22,8 +22,10 @@ from tqdm import tqdm
 import argparse
 import torch
 import sys
+from multiprocessing import Pool
 sys.path.append('../../eg3d')
 from camera_utils import create_cam2world_matrix
+from concurrent.futures import ProcessPoolExecutor
 
 COMPRESS_LEVEL=0
     
@@ -76,54 +78,72 @@ def flip_yaw(pose_matrix):
     flipped[0, 3] *= -1
     return flipped
 
+def process_image(args, cameras):
+    source, dest, filename, mode = args
+
+    if filename not in cameras:
+        return None
+
+    pose = cameras[filename]['pose']
+    intrinsics = cameras[filename]['intrinsics']
+
+    if mode == 'cor':
+        pose = fix_pose(pose)
+    elif mode == 'orig':
+        pose = fix_pose_orig(pose)
+    elif mode == 'simplify':
+        pose = fix_pose_simplify(pose)
+    intrinsics = fix_intrinsics(intrinsics)
+    label = np.concatenate([pose.reshape(-1), intrinsics.reshape(-1)]).tolist()
+
+    # image_path = os.path.join(source, filename)
+    # img = Image.open(image_path)
+
+    # os.makedirs(os.path.dirname(os.path.join(dest, filename)), exist_ok=True)
+    # img.save(os.path.join(dest, filename))
+
+    # flipped_img = ImageOps.mirror(img)
+    flipped_pose = flip_yaw(pose)
+    flipped_label = np.concatenate([flipped_pose.reshape(-1), intrinsics.reshape(-1)]).tolist()
+    base, ext = os.path.splitext(filename)
+    flipped_filename = base + '_mirror' + ext
+    # flipped_img.save(os.path.join(dest, flipped_filename))
+
+    return [[filename, label], [flipped_filename, flipped_label]]
+from tqdm import tqdm
+
+# Other parts of your code remain the same
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=str)
-    parser.add_argument("--dest", type=str, default=None)
+    parser.add_argument("--dest", type=str)
     parser.add_argument("--max_images", type=int, default=None)
-    parser.add_argument("--mode", type=str, default="orig", choices=["orig", "cor"])
+    parser.add_argument("--mode", type=str, default="orig", choices=["orig", "cor", "simplify"])
+    parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
+    # 一次性读取 JSON 文件
     camera_dataset_file = os.path.join(args.source, 'cameras.json')
-
     with open(camera_dataset_file, "r") as f:
         cameras = json.load(f)
-        
-    dataset = {'labels':[]}
 
-    max_images = args.max_images if args.max_images is not None else len(cameras)
-    for i, filename in tqdm(enumerate(cameras), total=max_images):
-        if (max_images is not None and i >= max_images): break
+    filenames = list(cameras.keys())
+    if args.max_images:
+        filenames = filenames[:args.max_images]
 
-        pose = cameras[filename]['pose']
-        intrinsics = cameras[filename]['intrinsics']
+    tasks = [(args.source, args.dest, f, args.mode) for f in filenames]
 
-        if args.mode == 'cor':
-            pose = fix_pose(pose)
-        elif args.mode == 'orig':
-            pose = fix_pose_orig(pose)
-        elif args.mode == 'simplify':
-            pose = fix_pose_simplify(pose)
-        else:
-            assert False, "invalid mode"
-        intrinsics = fix_intrinsics(intrinsics)
-        label = np.concatenate([pose.reshape(-1), intrinsics.reshape(-1)]).tolist()
-            
-        image_path = os.path.join(args.source, filename)
-        img = Image.open(image_path)
-
-        dataset["labels"].append([filename, label])
-        os.makedirs(os.path.dirname(os.path.join(args.dest, filename)), exist_ok=True)
-        img.save(os.path.join(args.dest, filename))
+    # 使用进程池来并行处理图片
+    with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
+        # tqdm 可以显示进度条
+        results = list(tqdm(executor.map(process_image, tasks, [cameras] * len(tasks)), total=len(tasks)))
 
 
-        flipped_img = ImageOps.mirror(img)
-        flipped_pose = flip_yaw(pose)
-        label = np.concatenate([flipped_pose.reshape(-1), intrinsics.reshape(-1)]).tolist()
-        base, ext = filename.split('.')[0], '.' + filename.split('.')[1]
-        flipped_filename = base + '_mirror' + ext
-        dataset["labels"].append([flipped_filename, label])
-        flipped_img.save(os.path.join(args.dest, flipped_filename))
-        
+    dataset = {'labels': []}
+    for result in results:
+        if result:
+            dataset['labels'].extend(result)
+
     with open(os.path.join(args.dest, 'dataset.json'), "w") as f:
         json.dump(dataset, f)

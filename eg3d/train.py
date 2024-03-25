@@ -67,20 +67,23 @@ def launch_training(c, desc, outdir, dry_run):
     assert not os.path.exists(c.run_dir)
 
     # Print options.
-    print()
-    print('Training options:')
-    print(json.dumps(c, indent=2))
-    print()
-    print(f'Output directory:    {c.run_dir}')
-    print(f'Number of GPUs:      {c.num_gpus}')
-    print(f'Batch size:          {c.batch_size} images')
-    print(f'Training duration:   {c.total_kimg} kimg')
-    print(f'Dataset path:        {c.training_set_kwargs.path}')
-    print(f'Dataset size:        {c.training_set_kwargs.max_size} images')
-    print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
-    print(f'Dataset labels:      {c.training_set_kwargs.use_labels}')
-    print(f'Dataset x-flips:     {c.training_set_kwargs.xflip}')
-    print()
+    try:
+        print()
+        print('Training options:')
+        print(json.dumps(c, indent=2))
+        print()
+        print(f'Output directory:    {c.run_dir}')
+        print(f'Number of GPUs:      {c.num_gpus}')
+        print(f'Batch size:          {c.batch_size} images')
+        print(f'Training duration:   {c.total_kimg} kimg')
+        print(f'Dataset path:        {c.training_set_kwargs.path}')
+        print(f'Dataset size:        {c.training_set_kwargs.max_size} images')
+        print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
+        print(f'Dataset labels:      {c.training_set_kwargs.use_labels}')
+        print(f'Dataset x-flips:     {c.training_set_kwargs.xflip}')
+        print()
+    except Exception as e:
+        print(f'Error: {e}')
 
     # Dry run?
     if dry_run:
@@ -104,9 +107,13 @@ def launch_training(c, desc, outdir, dry_run):
 
 #----------------------------------------------------------------------------
 
-def init_dataset_kwargs(data):
+def init_dataset_kwargs(data,class_name):
     try:
-        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
+        if type(data)==list:
+            assert class_name == 'training.dataset.CombinedImageDataset', f'Only CombinedImageDataset supports weighted datasets, but got {class_name}'
+            dataset_kwargs = dnnlib.EasyDict(class_name=class_name, datasets_info=data, use_labels=True, max_size=None, xflip=False)
+        else:
+            dataset_kwargs = dnnlib.EasyDict(class_name=class_name, path=data, use_labels=True, max_size=None, xflip=False)
         dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
         dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
         dataset_kwargs.use_labels = dataset_obj.has_labels # Be explicit about labels.
@@ -179,7 +186,7 @@ def parse_comma_separated_list(s):
 @click.option('--gpc_reg_fade_kimg', help='Length of swapping prob fade', metavar='INT',  type=click.IntRange(min=0), required=False, default=1000)
 @click.option('--disc_c_noise', help='Strength of discriminator pose conditioning regularization, in standard deviations.', metavar='FLOAT',  type=click.FloatRange(min=0), required=False, default=0)
 @click.option('--sr_noise_mode', help='Type of noise for superresolution', metavar='STR',  type=click.Choice(['random', 'none']), required=False, default='none')
-@click.option('--resume_blur', help='Enable to blur even on resume', metavar='BOOL',  type=bool, required=False, default=False)
+@click.option('--resume_blur', help='Enable to blur even on ', metavar='BOOL',  type=bool, required=False, default=False)
 @click.option('--sr_num_fp16_res',    help='Number of fp16 layers in superresolution', metavar='INT', type=click.IntRange(min=0), default=4, required=False, show_default=True)
 @click.option('--g_num_fp16_res',    help='Number of fp16 layers in generator', metavar='INT', type=click.IntRange(min=0), default=0, required=False, show_default=True)
 @click.option('--d_num_fp16_res',    help='Number of fp16 layers in discriminator', metavar='INT', type=click.IntRange(min=0), default=4, required=False, show_default=True)
@@ -192,7 +199,12 @@ def parse_comma_separated_list(s):
 @click.option('--density_reg_p_dist',    help='density regularization strength.', metavar='FLOAT', type=click.FloatRange(min=0), default=0.004, required=False, show_default=True)
 @click.option('--reg_type', help='Type of regularization', metavar='STR',  type=click.Choice(['l1', 'l1-alt', 'monotonic-detach', 'monotonic-fixed', 'total-variation']), required=False, default='l1')
 @click.option('--decoder_lr_mul',    help='decoder learning rate multiplier.', metavar='FLOAT', type=click.FloatRange(min=0), default=1, required=False, show_default=True)
-
+# lora_dim, int, default 0
+@click.option('--lora_dim', help='Dimension of lora', metavar='INT',  type=click.IntRange(min=0), required=False, default=0)
+# lora_alpha, float, default 1.
+@click.option('--lora_alpha', help='Alpha of lora', metavar='FLOAT',  type=click.FloatRange(min=0), required=False, default=1.)
+# dataset_class_name, default 'training.dataset.ImageFolderDataset', str
+@click.option('--dataset_class_name', help='Dataset class name', metavar='STR',  type=str, required=False, default='training.dataset.ImageFolderDataset')
 def main(**kwargs):
     """Train a GAN using the techniques described in the paper
     "Alias-Free Generative Adversarial Networks".
@@ -226,7 +238,13 @@ def main(**kwargs):
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
 
     # Training set.
-    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
+    if len(opts.data.split(','))>1: # in this situation, the input is a string of comma-separated paths, path1,weight1,path2,weight2,... change it into a list of tuples
+        data = opts.data.split(',')
+        data = [(data[i], int(data[i+1])) for i in range(0, len(data), 2)]
+    else:
+        data = opts.data
+        
+    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=data,class_name=opts.dataset_class_name)
     if opts.cond and not c.training_set_kwargs.use_labels:
         raise click.ClickException('--cond=True requires labels specified in dataset.json')
     c.training_set_kwargs.use_labels = opts.cond
@@ -239,6 +257,12 @@ def main(**kwargs):
     c.G_kwargs.channel_base = c.D_kwargs.channel_base = opts.cbase
     c.G_kwargs.channel_max = c.D_kwargs.channel_max = opts.cmax
     c.G_kwargs.mapping_kwargs.num_layers = opts.map_depth
+    if opts.lora_dim > 0:
+        c.G_kwargs.lora_dim = opts.lora_dim
+        c.G_kwargs.lora_alpha = opts.lora_alpha
+        c.G_kwargs.mapping_kwargs.lora_dim = opts.lora_dim
+        c.G_kwargs.mapping_kwargs.lora_alpha = opts.lora_alpha
+
     c.D_kwargs.block_kwargs.freeze_layers = opts.freezed
     c.D_kwargs.epilogue_kwargs.mbstd_group_size = opts.mbstd_group
     c.loss_kwargs.r1_gamma = opts.gamma

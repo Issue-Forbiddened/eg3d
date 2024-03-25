@@ -114,6 +114,10 @@ def create_samples(N=256, voxel_origin=[0, 0, 0], cube_length=2.0):
 @click.option('--fov-deg', help='Field of View of camera in degrees', type=int, required=False, metavar='float', default=18.837, show_default=True)
 @click.option('--shape-format', help='Shape Format', type=click.Choice(['.mrc', '.ply']), default='.mrc')
 @click.option('--reload_modules', help='Overload persistent modules?', type=bool, required=False, metavar='BOOL', default=False, show_default=True)
+# lora_dim, int, default 0
+@click.option('--lora_dim', help='Dimension of the LoRA', type=int, required=False, metavar='int', default=0, show_default=True)
+# lora_alpha, float, default 1.0
+@click.option('--lora_alpha', help='Alpha value of the LoRA', type=float, required=False, metavar='float', default=1.0, show_default=True)
 def generate_images(
     network_pkl: str,
     seeds: List[int],
@@ -126,6 +130,8 @@ def generate_images(
     shape_format: str,
     class_idx: Optional[int],
     reload_modules: bool,
+    lora_dim: int,
+    lora_alpha: float,
 ):
     """Generate images using pretrained network pickle.
 
@@ -144,10 +150,21 @@ def generate_images(
     # Specify reload_modules=True if you want code modifications to take effect; otherwise uses pickled code
     if reload_modules:
         print("Reloading Modules!")
-        G_new = TriPlaneGenerator_Modified(*G.init_args, **G.init_kwargs).eval().requires_grad_(False).to(device)
-        misc.copy_params_and_buffers(G, G_new, require_all=True)
+        if 'lora_dim' in G.init_kwargs:
+            # G.init_kwargs['lora_dim'] = lora_dim
+            # G.init_kwargs['lora_alpha'] = lora_alpha
+            G_init_kwargs_new=G.init_kwargs.copy()
+            G_init_kwargs_new['lora_dim']=lora_dim
+            G_init_kwargs_new['lora_alpha']=lora_alpha
+            G_init_kwargs_new['mapping_kwargs']['lora_dim']=lora_dim
+            G_init_kwargs_new['mapping_kwargs']['lora_alpha']=lora_alpha
+            G_new = TriPlaneGenerator_Modified(*G.init_args, **G_init_kwargs_new).eval().requires_grad_(False).to(device)
+        else:
+            G_new = TriPlaneGenerator_Modified(*G.init_args, **G.init_kwargs).eval().requires_grad_(False).to(device)
+        misc.copy_params_and_buffers(G, G_new, require_all=False)
         G_new.neural_rendering_resolution = G.neural_rendering_resolution
         G_new.rendering_kwargs = G.rendering_kwargs
+
         G = G_new
 
     os.makedirs(outdir, exist_ok=True)
@@ -161,12 +178,13 @@ def generate_images(
     intrinsics = FOV_to_intrinsics(fov_deg, device=device)
 
     num_image_per_identity = 3
-    angle_p_max=0.3
-    angle_p_min=-0.3
-    angle_y_max=0.4
-    angle_y_min=-0.4
+    angle_p_max=0.5
+    angle_p_min=-0.5
+    angle_y_max=0.7
+    angle_y_min=-0.7
     import tqdm
     bar=tqdm.tqdm(total=len(seeds)*num_image_per_identity)
+    camera_param_list=[]
     # Generate images.
     for seed_idx, seed in enumerate(seeds):
         print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
@@ -190,15 +208,31 @@ def generate_images(
 
             planes=G.get_planes(ws)
             if image_idx==0:
-                torch.save(planes[0].to(torch.float16), os.path.join(outdir_triplane, f'id_{seed_idx}_planes.pt'))
+                torch.save(planes[0].to(torch.float16), os.path.join(outdir_triplane, f'id_{seed}_planes.pt'))
 
-            img = G.render_from_planes(camera_params,planes)['image']
+            render_return=G.render_from_planes(camera_params,planes)
+            img = render_return['image']
 
             img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
 
-            PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(os.path.join(outdir_image, f'id_{seed_idx}_img_{image_idx}.png'))
+            PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(os.path.join(outdir_image, f'id_{seed}_img_{image_idx}.png'))
+
+            depth_image= render_return['image_depth']
+            # normalize
+            depth_image = (depth_image - depth_image.min()) / (depth_image.max() - depth_image.min())
+            depth_image = (depth_image * 255).to(torch.uint8).squeeze(0).cpu().numpy()
+
+            PIL.Image.fromarray(depth_image[0], 'L').save(os.path.join(outdir_image, f'id_{seed}_depth_{image_idx}.png'))
+
+            camera_param_list.append((f'id_{seed}_img_{image_idx}.png',camera_params.squeeze(-1).cpu().numpy().tolist()))
 
             bar.update(1)
+    import json
+    with open(os.path.join(outdir, f'camera_params_{seed}.txt'), 'w') as f:
+        tosave={}
+        tosave['labels']=camera_param_list
+        json.dump(tosave, f)
+
 
         
 

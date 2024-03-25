@@ -30,7 +30,7 @@ args = parser.parse_args()
 
 # 这是将要在每个线程中执行的函数
 def run_command(rank):
-    command = f"CUDA_VISIBLE_DEVICES={rank} python batch_mtcnn.py --in_root {args.indir}"
+    command = f"python batch_mtcnn.py --in_root {args.indir}"
     print(command)
     os.system(command)
 
@@ -52,39 +52,37 @@ command = f"mkdir {args.indir}/tmp_files; unlink Deep3DFaceRecon_pytorch/checkpo
 print(command)
 os.system(command)
 
-# run Deep3DFaceRecon
-os.chdir('Deep3DFaceRecon_pytorch')
-command = f"CUDA_VISIBLE_DEVICES={args.gpu_ids} python test.py --img_folder=" + args.indir + f" --gpu_ids={args.gpu_ids} --name=pretrained --epoch=20"
-print(command)
-os.system(command)
-os.chdir('..')
+# # run Deep3DFaceRecon
+# os.chdir('Deep3DFaceRecon_pytorch')
+# command = f"CUDA_VISIBLE_DEVICES={args.gpu_ids} python test.py --img_folder=" + args.indir + f" --gpu_ids={args.gpu_ids} --name=pretrained --epoch=20"
+# print(command)
+# os.system(command)
+# os.chdir('..')
 
 # 这是将要在每个线程中执行的函数
 def run_command(rank):
-    command = f"python crop_images_in_the_wild.py --indir={args.indir} --rank={rank} --world_size=8"
+    command = f"python crop_images_in_the_wild.py --indir={args.indir} --rank={rank} --world_size=16"
     print(command)
     os.system(command)
 
 # 使用ThreadPoolExecutor创建一个线程池
-with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
     # 将每个命令作为一个任务提交给线程池
-    futures = [executor.submit(run_command, i) for i in range(8)]
+    futures = [executor.submit(run_command, i) for i in range(16)]
 
     # 等待所有任务完成
     for future in concurrent.futures.as_completed(futures):
         future.result()  # 获取任务结果，这里不做特别处理
 
-# convert the pose to our format
-command = f"python 3dface2idr_mat.py --in_root Deep3DFaceRecon_pytorch/checkpoints/pretrained/results/{out_folder}/epoch_20_000000 --out_path {os.path.join(args.indir, 'crop', 'cameras.json')}"
-# command = f"python 3dface2idr_mat.py --in_root /root/eg3d/dataset_preprocessing/ffhq/Deep3DFaceRecon_pytorch/checkpoints/pretrained/results/epoch_20_000000 --out_path {os.path.join(args.indir, 'crop', 'cameras.json')}"
-print(command)
-os.system(command)
-
-# additional correction to match the submission version
-command = f"python preprocess_face_cameras.py --source {os.path.join(args.indir, 'crop')} --dest {args.indir} --mode orig"
-print(command)
-os.system(command)
-
-# # clean Deep3DFaceRecon_pytorch/checkpoints/pretrained/results/{out_folder}/epoch_20_000000
-# command = f"rm -rf Deep3DFaceRecon_pytorch/checkpoints/pretrained/results/{out_folder}/epoch_20_000000"
+# # convert the pose to our format
+# command = f"python 3dface2idr_mat.py --in_root Deep3DFaceRecon_pytorch/checkpoints/pretrained/results/{out_folder}/epoch_20_000000 --out_path {os.path.join(args.indir, 'crop', 'cameras.json')}"
+# # command = f"python 3dface2idr_mat.py --in_root /root/eg3d/dataset_preprocessing/ffhq/Deep3DFaceRecon_pytorch/checkpoints/pretrained/results/epoch_20_000000 --out_path {os.path.join(args.indir, 'crop', 'cameras.json')}"
 # print(command)
+# os.system(command)
+
+# # additional correction to match the submission version
+# command = f"python preprocess_face_cameras.py --source {os.path.join(args.indir, 'crop')} --dest {args.indir} --mode orig"
+# print(command)
+# os.system(command)
+
+

@@ -19,3 +19,6 @@ eg3d/outputs
 
 eg3d/dataset_*
 eg3d/try_*
+archive.tar.gz
+
+untracked
